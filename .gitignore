@@ -1,0 +1,39 @@
+# Heavy project artifacts
+data/
+prepared*/
+third_party/
+weights/
+output/
+inference/
+predictions.txt
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Model weights / binaries (anywhere they might land)
+*.pdparams
+*.pth
+*.onnx
+*.ckpt
+*.safetensors
+
+# Gradio runtime
+gradio_cached_examples/
+.gradio/
+
+# Env & secrets
+.env
+
+# Editors & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

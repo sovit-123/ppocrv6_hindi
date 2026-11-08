@@ -1,0 +1,18 @@
+# CPU smoke-tested top-level training dependencies, Python 3.12.
+# Install PaddlePaddle separately for your CPU/GPU. Transitive dependencies are not fully locked.
+shapely==2.2.0
+scikit-image==0.26.0
+pyclipper==1.4.0
+lmdb==3.0.0
+tqdm==4.70.1
+numpy==2.3.5
+rapidfuzz==3.14.6
+opencv-python==5.0.0.93
+opencv-contrib-python==5.0.0.93
+cython==3.3.1
+Pillow==13.0.0
+PyYAML==6.0.3
+requests==2.34.2
+albumentations==2.0.8
+albucore==0.0.24
+packaging==26.3
