@@ -9,7 +9,7 @@ traditional PaddleOCR recognizer, not PaddleOCR-VL. No detector is trained.
 1. Downloads exactly **one image archive** (batch 001 by default) and the shared
    `devanagari_ocr.json` annotations file.
 2. Extracts only basenames starting with `hindi_local`, `iiit_hindi`, or
-   `hindidataocr`, matching Sovit's existing Hindi training scripts.
+   `hindidataocr`: the Hindi-named source subsets used in this pilot.
 3. Streams annotations using the real `images` + `messages` schema. The older
    `image` + `conversations` schema is also supported.
 4. Keeps annotated, valid, Devanagari-containing crops, removes exact decoded
@@ -19,10 +19,10 @@ traditional PaddleOCR recognizer, not PaddleOCR-VL. No detector is trained.
    vocabulary-dependent CTC projection and NRTR embedding/output projection, and
    fine-tunes all model parameters using upstream PaddleOCR tools.
 
-This is a new pilot split, **not the existing project's benchmark split**. It
-follows the same sort → seed-42 shuffle → test/val/train slicing convention, but
-filters this one shard first. Do not compare its scores directly with prior runs
-on different samples. Prefixes identify sources; they are not a language detector.
+This is a new pilot split: sort, seed-42 shuffle, then test/val/train slicing,
+applied after filtering this one shard. Do not compare its scores directly with
+runs on other shards or different filters. Prefixes identify sources; they are
+not a language detector.
 
 ## Important scope: words and SHORT lines
 
@@ -44,21 +44,22 @@ Samples narrower than their height are excluded by default; adjust
 
 ## Requirements
 
-- Python **3.12**, matching the packaged dependency versions and local checks.
+- Python **3.12**, the version the pinned dependency set was resolved with.
 - Git and internet access to GitHub, Hugging Face, and Paddle's model host.
-- Linux and an NVIDIA GPU recommended for training (e.g. your Modal shell).
+- Linux and an NVIDIA GPU recommended for training.
   CPU mode is useful for smoke tests. GPU memory needs depend on batch size;
   start at 16 and reduce to 4 or 8 if needed. No VRAM guarantee is implied.
 - Allow several GB for one archive (~1.4 GB), the complete annotations (~2.1 GB),
   extracted Hindi images, dependencies, weights, and training checkpoints.
   **One tarball does not eliminate the shared annotation download.**
 
-The ZIP contains code and a reference upstream YAML, not the dataset, pretrained
-weights, or a vendored PaddleOCR checkout. No PyTorch/Transformers stack is needed.
+This repository contains code and a reference upstream YAML; the dataset,
+pretrained weights, and the pinned PaddleOCR checkout are downloaded by the
+setup and preparation steps. No PyTorch/Transformers stack is needed.
 
 ## 1. Install and fetch the pinned PaddleOCR source
 
-Extract the ZIP and open a terminal in `ppocrv6_hindi/`.
+Clone the repository and open a terminal in the project directory.
 
 ```bash
 python3.12 -m venv .venv
@@ -72,6 +73,12 @@ Install **one** PaddlePaddle build. For a conventional NVIDIA CUDA-12.6-compatib
 machine, an example is:
 
 ```bash
+python -m pip install paddlepaddle-gpu==3.2.2 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
+```
+
+If you are using CUDA 13.x, install PaddlePaddle with CUDA 13 support. This also works best for the latest RTX Blackwell GPUs.
+
+```
 python -m pip install paddlepaddle-gpu==3.3.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu130/
 ```
 
@@ -94,7 +101,7 @@ python -c "import paddle; print(paddle.__version__); paddle.utils.run_check()"
 python -c "import paddle; print('CUDA build:', paddle.is_compiled_with_cuda()); print('GPUs:', paddle.device.cuda.device_count())"
 ```
 
-`setup` pins PaddleOCR to `dab3fe35379033fdcb2d0e9572fac0b36c9a9ebf`, inspected
+`setup` pins PaddleOCR to `dab3fe35379033fdcb2d0e9572fac0b36c9a9ebf`, reviewed
 for its v6 architecture, config, checkpoint loader, label encoders and tools.
 It refuses a different revision or dirty checkout rather than silently changing
 training behavior. Dependency ranges in this project and upstream requirements
@@ -112,17 +119,6 @@ records it in `prepared/dataset_source.json` (new downloads).
 Only images from that selected archive are eligible, even if other images exist
 on disk. Other tarballs are never downloaded automatically. Annotation orphans
 and records referring to other shards do not become samples.
-
-To reuse downloads already made by your existing project:
-
-```bash
-python prepare.py --batch 1 --offline --data-dir /absolute/path/to/devanagari_ocr/input/devanagari_ocr_dataset
-```
-
-Use the same `--data-dir` when configuring below. This only reads the annotations
-and selected archive, and writes the extracted Hindi crops; it does not modify
-that project's split file. Existing extracted images are not enough: offline
-mode requires the selected tarball to enforce one-shard membership.
 
 Open these files before proceeding:
 
@@ -168,7 +164,6 @@ interrupted extraction can be repeated with a fresh/nonexistent output folder.
 python run.py configure --batch-size 16 --epochs 30 --lr 0.0001 --workers 2
 ```
 
-For reused data, add `--data-dir /absolute/path/to/the/dataset`.
 For another prepared directory, add `--prepared prepared_batch2` on this and every
 subsequent command. Configuration uses absolute paths, so regenerate it if you
 move the project. `--batch-size`, `--epochs`, `--lr`, `--workers`, `--output`, and
@@ -233,9 +228,9 @@ Use `--checkpoint /path/to/checkpoint` to select another checkpoint prefix or
 `.pdparams` file. Keep the test split out of tuning decisions.
 
 Upstream evaluation reports recognition accuracy and normalized edit-distance
-metrics. **These are not your repository's grapheme CER/codepoint CER/WER
-protocol.** This starter does not claim metric compatibility; use your shared
-benchmark protocol for a later fair comparison on identical held-out samples.
+metrics. **These are not grapheme CER/codepoint CER/WER.** This project does
+not claim compatibility with any external metric protocol; recompute with one
+fixed protocol on identical held-out samples for fair comparisons.
 
 ## 5. Predict a crop and export
 
@@ -247,7 +242,7 @@ python run.py export
 Raw crop predictions go to `predictions.txt`; exported inference files go to
 `inference/hindi_rec/`. Preserve the dictionary, generated YAML and initialization
 report alongside weights. The inference model's Hindi dictionary must match the
-training dictionary exactly. This starter uses upstream crop inference; integrating
+training dictionary exactly. This project uses upstream crop inference; integrating
 custom weights into a full detector + recognizer pipeline is a later step.
 
 ## Project files
@@ -260,7 +255,8 @@ custom weights into a full detector + recognizer pipeline is a later step.
 | `requirements-training.txt` | CPU smoke-tested top-level training dependency versions |
 | `vendor_config/` | Reference upstream YAML and its Apache license; actual config read from pinned checkout |
 | `tests/test_pipeline.py` | Synthetic schema, shard filtering, deduplication, split and config tests |
-| `VALIDATION.md` | What was actually checked when packaging |
+| `gradio_app.py` | Gradio UI for crop inference: exported finetuned model, or stock pretrained via run.py |
+| `copy_test_images.py` | Copies the held-out test-split crops into `data/infer_data` for manual testing |
 
 ## Troubleshooting and limitations
 
@@ -280,17 +276,12 @@ custom weights into a full detector + recognizer pipeline is a later step.
   layout. Manually review samples. Exact image deduplication does not eliminate
   near-duplicates or shared writer/document leakage.
 - NFC is the preparation normalization; do not assume its metrics are identical
-  to your existing benchmark's normalization.
-- Keep only one configured experiment per extracted project directory: weights
+  to results computed with a different normalization.
+- Keep only one configured experiment per project directory: weights
   and initialization metadata have fixed paths. Copy this small code project
   into a new folder for another vocabulary/experiment.
 
-## Sources and provenance
-
-Inspected source project: [sovit-123/devanagari_ocr](https://github.com/sovit-123/devanagari_ocr),
-commit `fd30e6e41f0a9774319cb84f2ef7910c667f9334` (README, download, extraction,
-splitting and Hindi training script). The dataset card describes an older schema;
-this implementation follows the actual schema documented in Sovit's repository.
+## References
 
 - [Dataset and upstream source credits](https://huggingface.co/datasets/himalaya-ai/devanagari_ocr_dataset)
 - [PP-OCRv6 introduction and customization support](https://www.paddleocr.ai/latest/en/version3.x/algorithm/PP-OCRv6/PP-OCRv6.html)
@@ -300,6 +291,6 @@ this implementation follows the actual schema documented in Sovit's repository.
 - [Pinned vocabulary sizing in training](https://github.com/PaddlePaddle/PaddleOCR/blob/dab3fe35379033fdcb2d0e9572fac0b36c9a9ebf/tools/train.py)
 
 The reference YAML and PaddleOCR retain their Apache-2.0 license. Dataset and
-model downloads are not redistributed in this ZIP; review their respective terms
-and credit the underlying source datasets for published work. New starter code is
-provided under Apache-2.0 (see LICENSE).
+model downloads are not redistributed in this repository; review their
+respective terms and credit the underlying source datasets for published work.
+This project's code is provided under Apache-2.0 (see LICENSE).
