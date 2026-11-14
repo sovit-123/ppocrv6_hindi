@@ -12,7 +12,11 @@ import yaml
 
 ROOT = Path(__file__).resolve().parent
 PADDLE_REF = 'dab3fe35379033fdcb2d0e9572fac0b36c9a9ebf'
-URL = 'https://paddle-model-ecology.bj.bcebos.com/paddlex/official_pretrained_model/PP-OCRv6_medium_rec_pretrained.pdparams'
+DEFAULT_UPSTREAM = ROOT/'third_party/PaddleOCR'
+WEIGHTS = ROOT/'weights'
+MODEL_SIZES = ('tiny','small','medium')
+PRETRAINED_FILENAME = 'PP-OCRv6_medium_rec_pretrained.pdparams'
+URL = f'https://paddle-model-ecology.bj.bcebos.com/paddlex/official_pretrained_model/{PRETRAINED_FILENAME}'
 RESET_PREFIXES = ('head.ctc_head.fc.', 'head.gtc_head.embedding.', 'head.gtc_head.tgt_word_prj.')
 
 
@@ -21,16 +25,63 @@ def shell(command, cwd=None):
     subprocess.run(list(map(str,command)), cwd=cwd, check=True)
 
 
-def setup(upstream):
+def validate_upstream(upstream):
+    if not upstream.is_dir():
+        raise ValueError(f'Missing {upstream}; run `python run.py setup` first.')
+    try:
+        actual = subprocess.check_output(['git','rev-parse','HEAD'],cwd=upstream,text=True).strip()
+        dirty = subprocess.check_output(['git','status','--porcelain'],cwd=upstream,text=True).strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ValueError(f'Cannot inspect upstream checkout {upstream}; use a separate checkout.') from exc
+    if actual != PADDLE_REF:
+        raise ValueError(f'Expected PaddleOCR {PADDLE_REF}; found {actual}. Use a separate checkout.')
+    if dirty:
+        raise ValueError('Upstream checkout has local changes; use a clean checkout.')
+
+
+def pretrained_filename(model_size):
+    if model_size not in MODEL_SIZES:
+        raise ValueError(f'Unknown model size {model_size!r}; choose from {MODEL_SIZES}.')
+    return f'PP-OCRv6_{model_size}_rec_pretrained.pdparams'
+
+
+def pretrained_url(model_size):
+    return f'https://paddle-model-ecology.bj.bcebos.com/paddlex/official_pretrained_model/{pretrained_filename(model_size)}'
+
+
+def download_weights(weights, model_size='medium'):
+    weights.mkdir(parents=True,exist_ok=True)
+    original = weights/pretrained_filename(model_size)
+    if not original.exists():
+        temp = original.with_suffix('.part')
+        print(f'Downloading official {model_size} training weights...',flush=True)
+        urllib.request.urlretrieve(pretrained_url(model_size),temp)
+        temp.replace(original)
+    if not original.is_file() or original.stat().st_size == 0:
+        raise ValueError(f'Official {model_size} weights are missing or empty: {original}')
+    return original
+
+
+def require_setup(upstream=DEFAULT_UPSTREAM, weights=WEIGHTS, model_size=None):
+    """Validate setup prerequisites without downloading or modifying anything."""
+    validate_upstream(upstream)
+    for size in MODEL_SIZES if model_size is None else (model_size,):
+        original = weights/pretrained_filename(size)
+        if original.is_file() and original.stat().st_size > 0:
+            return original
+    raise ValueError(f'Setup is incomplete: no usable official weights in {weights}. '
+                     'Run `python run.py setup --model-size {tiny,small,medium}` first.')
+
+
+def setup(upstream, weights=WEIGHTS, model_size='medium'):
     if not upstream.exists():
         shell(['git','clone','https://github.com/PaddlePaddle/PaddleOCR.git',upstream])
         shell(['git','checkout',PADDLE_REF], upstream)
-    actual = subprocess.check_output(['git','rev-parse','HEAD'],cwd=upstream,text=True).strip()
-    if actual != PADDLE_REF:
-        raise ValueError(f'Expected PaddleOCR {PADDLE_REF}; found {actual}. Use a separate checkout.')
-    if subprocess.check_output(['git','status','--porcelain'], cwd=upstream,text=True).strip():
-        raise ValueError('Upstream checkout has local changes; use a clean checkout.')
-    print('Pinned upstream ready. Install its training dependencies as described in README.')
+    validate_upstream(upstream)
+    original = download_weights(weights,model_size)
+    print(f'Pinned upstream and official {model_size} weights ready: {original}')
+    print('Install the training dependencies as described in README.')
+    return original
 
 
 def config_for(upstream, data, prepared, output, checkpoint, a):
@@ -68,12 +119,9 @@ def init_checkpoint(upstream, config, weights):
     from ppocr.modeling.architectures import build_model
     from ppocr.postprocess import build_post_process
     weights.mkdir(parents=True,exist_ok=True)
-    original = weights/'PP-OCRv6_medium_rec_pretrained.pdparams'
-    if not original.exists():
-        temp = original.with_suffix('.part')
-        print('Downloading official training weights...',flush=True)
-        urllib.request.urlretrieve(URL,temp)
-        temp.replace(original)
+    original = weights/PRETRAINED_FILENAME
+    if not original.is_file() or original.stat().st_size == 0:
+        raise ValueError(f'Missing official weights {original}; run `python run.py setup` first.')
     c = copy.deepcopy(config)
     decoder = build_post_process(c['PostProcess'],c['Global'])
     n = len(decoder.character)
@@ -121,7 +169,9 @@ def init_checkpoint(upstream, config, weights):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('action',choices=['setup','configure','train','eval','test','export','infer'])
-    p.add_argument('--upstream',type=Path,default=ROOT/'third_party/PaddleOCR')
+    p.add_argument('--upstream',type=Path,default=DEFAULT_UPSTREAM)
+    p.add_argument('--model-size',choices=MODEL_SIZES,default='medium',
+                   help='Official model weights to download during setup')
     p.add_argument('--data-dir',type=Path,default=ROOT/'data')
     p.add_argument('--prepared',type=Path,default=ROOT/'prepared')
     p.add_argument('--output',type=Path,default=ROOT/'output/hindi_rec')
@@ -143,8 +193,10 @@ def main():
         p.error('Invalid training arguments')
     if a.model=='official' and a.action!='infer':
         p.error('--model official is only valid with infer')
+    if a.model_size!='medium' and a.action!='setup':
+        p.error('--model-size is currently only valid with setup')
     if a.action=='setup':
-        setup(a.upstream); return
+        setup(a.upstream,model_size=a.model_size); return
     config_path = a.prepared/'hindi_rec.yml'
     if a.action=='configure':
         setup(a.upstream)
@@ -154,8 +206,8 @@ def main():
         for split in ('train','val','test'):
             if not (a.prepared/f'{split}.txt').is_file():
                 raise ValueError(f'Missing {split}.txt')
-        c = config_for(a.upstream,a.data_dir,a.prepared,a.output,ROOT/'weights/hindi_initialized.pdparams',a)
-        adapted = init_checkpoint(a.upstream,c,ROOT/'weights')
+        c = config_for(a.upstream,a.data_dir,a.prepared,a.output,WEIGHTS/'hindi_initialized.pdparams',a)
+        adapted = init_checkpoint(a.upstream,c,WEIGHTS)
         c['Global']['pretrained_model'] = str(adapted)
         config_path.write_text(yaml.safe_dump(c,sort_keys=False,allow_unicode=True))
         print(f'Wrote {config_path}'); return
@@ -165,9 +217,9 @@ def main():
         config_path = a.upstream/'configs/rec/PP-OCRv6/PP-OCRv6_medium_rec.yml'
         if not config_path.is_file():
             p.error(f'Missing {config_path}; run setup first.')
-        weights = ROOT/'weights/PP-OCRv6_medium_rec_pretrained.pdparams'
+        weights = WEIGHTS/PRETRAINED_FILENAME
         if not weights.is_file():
-            p.error(f'Missing {weights}; run configure once to download official weights.')
+            p.error(f'Missing {weights}; run setup first.')
         if a.checkpoint:
             p.error('--checkpoint selects fine-tuned weights; use --model finetuned.')
         if not a.image:
@@ -182,7 +234,7 @@ def main():
             p.error('Run configure first.')
         c = yaml.safe_load(config_path.read_text())
         current_hash = hashlib.sha256((a.prepared/'hindi_dict.txt').read_bytes()).hexdigest()
-        init = json.loads((ROOT/'weights/initialization.json').read_text())
+        init = json.loads((WEIGHTS/'initialization.json').read_text())
         if current_hash != init['dictionary_sha256']:
             raise ValueError('Dictionary changed; use a separate project/run and reconfigure.')
         overrides = [f'Global.use_gpu={a.device=="gpu"}']

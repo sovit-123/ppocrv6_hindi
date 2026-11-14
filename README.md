@@ -57,7 +57,7 @@ This repository contains code and a reference upstream YAML; the dataset,
 pretrained weights, and the pinned PaddleOCR checkout are downloaded by the
 setup and preparation steps. No PyTorch/Transformers stack is needed.
 
-## 1. Install and fetch the pinned PaddleOCR source
+## 1. Install, fetch PaddleOCR, and download pretrained weights
 
 Clone the repository and open a terminal in the project directory.
 
@@ -68,6 +68,17 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 python run.py setup
 ```
+
+`setup` clones the pinned PaddleOCR source and downloads the official medium
+training weights by default. Use `python run.py setup --model-size tiny` or
+`python run.py setup --model-size small` to download another variant instead.
+Weights are named `weights/PP-OCRv6_<size>_rec_pretrained.pdparams`. It is safe
+to repeat setup: an existing checkout is validated and existing weights are
+reused. Preparation accepts any of these completed weight downloads, including
+when using `prepare.py --offline`.
+
+At this stage, `--model-size` applies to **setup downloads only**; `configure`
+still builds the medium model. Training-model selection is a separate change.
 
 Install **one** PaddlePaddle build. For a conventional NVIDIA CUDA-12.6-compatible
 machine, an example is:
@@ -104,7 +115,8 @@ python -c "import paddle; print('CUDA build:', paddle.is_compiled_with_cuda()); 
 `setup` pins PaddleOCR to `dab3fe35379033fdcb2d0e9572fac0b36c9a9ebf`, reviewed
 for its v6 architecture, config, checkpoint loader, label encoders and tools.
 It refuses a different revision or dirty checkout rather than silently changing
-training behavior. Dependency ranges in this project and upstream requirements
+training behavior. Downloads use a temporary `.part` file before moving completed
+weights into place. Dependency ranges in this project and upstream requirements
 are not a complete cross-platform lockfile. Save `pip freeze` for each real run.
 
 ## 2. Prepare batch 001, Hindi prefixes only
@@ -170,8 +182,8 @@ move the project. `--batch-size`, `--epochs`, `--lr`, `--workers`, `--output`, a
 `--eval-every` are configuration-time settings; training reads the saved YAML.
 `--device cpu` can be used for CPU tests.
 
-This step downloads the **official training** `.pdparams`, builds the new
-vocabulary-sized CTC + auxiliary NRTR model, and writes:
+This step uses the **official training** `.pdparams` downloaded by `setup`,
+builds the new vocabulary-sized CTC + auxiliary NRTR model, and writes:
 
 - `weights/hindi_initialized.pdparams`: transferred weights plus newly initialized
   vocabulary layers. All other matching tensors, including the NRTR decoder,
@@ -250,7 +262,7 @@ custom weights into a full detector + recognizer pipeline is a later step.
 | File | Purpose |
 |---|---|
 | `prepare.py` | One-shard download/extraction, streamed annotations, checks, dictionary and split |
-| `run.py` | Pinned checkout, checkpoint adaptation, config generation, upstream tool commands |
+| `run.py` | Pinned checkout and weight setup, checkpoint adaptation, config generation, upstream tool commands |
 | `requirements.txt` | Small data/preparation dependencies; Paddle installed separately |
 | `requirements-training.txt` | CPU smoke-tested top-level training dependency versions |
 | `vendor_config/` | Reference upstream YAML and its Apache license; actual config read from pinned checkout |
@@ -294,3 +306,17 @@ The reference YAML and PaddleOCR retain their Apache-2.0 license. Dataset and
 model downloads are not redistributed in this repository; review their
 respective terms and credit the underlying source datasets for published work.
 This project's code is provided under Apache-2.0 (see LICENSE).
+
+## Update log
+
+### 2026-11-14
+
+- `run.py setup --model-size {tiny,small,medium}` now downloads the selected
+  official training weights in addition to cloning and validating the pinned
+  PaddleOCR checkout. Medium remains the default, and re-running setup reuses
+  the existing checkout and weights. Model-size selection currently applies to
+  setup only; configuration remains medium until the training-model change.
+- `prepare.py` now requires a completed setup before any dataset download or
+  extraction, including offline preparation.
+- `configure` uses the weights downloaded by setup rather than downloading them
+  during checkpoint initialization.
