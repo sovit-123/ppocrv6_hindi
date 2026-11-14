@@ -1,4 +1,19 @@
-"""Download exactly one shard, extract Hindi crops, stream labels, and split."""
+"""Download selected shards, extract supported Hindi crops, stream labels, and split.
+
+The selected sources are hindi_local, iiit_hindi, hindidataocr, and kaggle.
+Nepali annotations are excluded. The shared annotation file is downloaded once
+and scanned once, regardless of the number of selected image archives.
+
+USAGE:
+    python prepare.py --batch 1
+    python prepare.py --batches 1 2 3 --output prepared_batches_001_003
+    python prepare.py --all-batches --output prepared_all
+    python prepare.py --batches 1 2 --offline --output prepared_offline
+
+--batch remains compatible with the original single-archive workflow. Use a
+fresh output directory for every preparation run. --all-batches downloads all
+42 archives and requires substantial disk space.
+"""
 import argparse
 from collections import Counter
 import csv
@@ -12,7 +27,7 @@ import unicodedata
 
 from PIL import Image, ImageDraw
 
-PREFIXES = ('hindi_local', 'iiit_hindi', 'hindidataocr')
+PREFIXES = ('hindi_local', 'iiit_hindi', 'hindidataocr', 'kaggle')
 REPO = 'himalaya-ai/devanagari_ocr_dataset'
 ROOT = Path(__file__).resolve().parent
 
@@ -35,16 +50,18 @@ def annotations(path):
                     yield json.loads(line)
 
 
-def extract(tarpath, target, prefixes):
+def extract(tarpath, target, prefixes, names=None):
+    """Extract selected images and reject duplicate basenames across archives."""
     target.mkdir(parents=True, exist_ok=True)
-    names = set()
+    if names is None:
+        names = set()
     with tarfile.open(tarpath, 'r|gz') as archive:
         for member in archive:
             name = Path(member.name).name
             if not member.isfile() or not name.startswith(prefixes):
                 continue
             if name in names:
-                raise ValueError(f'Duplicate tar basename: {name}')
+                raise ValueError(f'Duplicate selected image basename: {name} ({tarpath.name})')
             names.add(name)
             source = archive.extractfile(member)
             with source, (target / name).open('wb') as out:
@@ -66,10 +83,20 @@ def ctc_steps(text):
     return len(text) + sum(a == b for a, b in zip(text, text[1:]))
 
 
-def prepare(data, archive, out, seed=42, max_length=40, min_ratio=1.0):
+def prepare(data, archives, out, seed=42, max_length=40, min_ratio=1.0):
+    """Prepare one combined split from one archive or an iterable of archives."""
     if out.exists():
         raise ValueError(f'{out} exists; choose a new --output directory to preserve splits.')
-    names = extract(archive, data / 'devanagari_ocr', PREFIXES)
+    if isinstance(archives, (str, Path)):
+        archives = [archives]
+    archives = [Path(archive) for archive in archives]
+    if not archives:
+        raise ValueError('Select at least one image archive.')
+    if len(set(archives)) != len(archives):
+        raise ValueError('Each image archive may be selected only once.')
+    names = set()
+    for archive in archives:
+        extract(archive, data / 'devanagari_ocr', PREFIXES, names)
     stats = Counter(extracted_hindi=len(names))
     samples, seen, digests = [], set(), set()
     for record in annotations(data / 'devanagari_ocr.json'):
@@ -125,7 +152,7 @@ def prepare(data, archive, out, seed=42, max_length=40, min_ratio=1.0):
     stats['orphan_images'] = len(names - seen)
     if min(n_test, n_val, n - n_test - n_val) < 1:
         print(json.dumps(dict(stats), indent=2))
-        raise ValueError(f'Only {n} usable Hindi samples in this shard; choose another --batch.')
+        raise ValueError(f'Only {n} usable Hindi samples in the selected archives.')
     splits = {'test': samples[:n_test], 'val': samples[n_test:n_test+n_val], 'train': samples[n_test+n_val:]}
     # Fixed script inventory + ASCII; other punctuation/characters learned from train only.
     chars = set(chr(i) for i in range(0x900, 0x980)) | set(chr(i) for i in range(33, 127))
@@ -142,7 +169,9 @@ def prepare(data, archive, out, seed=42, max_length=40, min_ratio=1.0):
             (out / f'{split}.txt').write_text(''.join(f'{p}\t{t}\n' for p,t in rows), encoding='utf-8')
             writer.writerows((p, split) for p, _ in rows)
     oov = {s: sorted(set(''.join(t for _,t in rows)) - vocab) for s,rows in splits.items()}
-    report = {'seed': seed, 'archive': archive.name, 'archive_bytes': archive.stat().st_size,
+    report = {'seed': seed,
+              'archives': [{'name': archive.name, 'bytes': archive.stat().st_size}
+                           for archive in archives],
               'prefixes': PREFIXES, 'stats': dict(stats), 'counts': {s: len(r) for s,r in splits.items()},
               'per_prefix': {s: dict(Counter(next(p for p in PREFIXES if Path(x).name.startswith(p)) for x,_ in rows)) for s,rows in splits.items()},
               'max_length': max_length, 'ctc_time_steps': 40, 'min_aspect_ratio': min_ratio,
@@ -164,10 +193,16 @@ def prepare(data, archive, out, seed=42, max_length=40, min_ratio=1.0):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--batch', type=int, default=1, choices=range(1,43))
+    batch_group = p.add_mutually_exclusive_group()
+    batch_group.add_argument('--batch', '--batches', dest='batches', type=int,
+                             nargs='+', choices=range(1,43), metavar='N',
+                             help='Batch numbers to download and combine (default: 1)')
+    batch_group.add_argument('--all-batches', action='store_true',
+                             help='Download and combine all 42 image archives')
     p.add_argument('--data-dir', type=Path, default=ROOT/'data')
     p.add_argument('--output', type=Path, default=ROOT/'prepared')
-    p.add_argument('--offline', action='store_true', help='Use existing annotations and selected archive, without downloading')
+    p.add_argument('--offline', action='store_true',
+                   help='Use existing annotations and selected archives, without downloading')
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--max-length', type=int, default=40)
     p.add_argument('--min-aspect-ratio', type=float, default=1.)
@@ -176,18 +211,36 @@ def main():
         p.error('max-length must be 1..40; min-aspect-ratio must be positive')
     if a.output.exists():
         p.error('Output exists; choose a new --output directory.')
+    batches = list(range(1,43)) if a.all_batches else (a.batches or [1])
+    if len(set(batches)) != len(batches):
+        p.error('Duplicate batch numbers are not allowed.')
+    batches.sort()
+    shards = [f'data/images_batch_{batch:03d}.tar.gz' for batch in batches]
     a.data_dir = a.data_dir.resolve(); a.output = a.output.resolve()
-    shard = f'data/images_batch_{a.batch:03d}.tar.gz'
     if not a.offline:
         from huggingface_hub import HfApi, hf_hub_download
         revision = HfApi().dataset_info(REPO).sha
-        for filename in ('devanagari_ocr.json', shard):
-            hf_hub_download(REPO, filename, repo_type='dataset', revision=revision, local_dir=a.data_dir)
-        (a.data_dir/f'source_batch_{a.batch:03d}.json').write_text(json.dumps({'repo':REPO,'revision':revision,'files':['devanagari_ocr.json',shard]},indent=2))
-    prepare(a.data_dir, a.data_dir/shard, a.output, a.seed, a.max_length, a.min_aspect_ratio)
-    provenance = a.data_dir/f'source_batch_{a.batch:03d}.json'
-    if provenance.exists():
-        shutil.copyfile(provenance, a.output/'dataset_source.json')
+        hf_hub_download(REPO, 'devanagari_ocr.json', repo_type='dataset',
+                        revision=revision, local_dir=a.data_dir)
+        for batch, shard in zip(batches, shards):
+            hf_hub_download(REPO, shard, repo_type='dataset', revision=revision,
+                            local_dir=a.data_dir)
+            provenance = {'repo': REPO, 'revision': revision,
+                          'files': ['devanagari_ocr.json', shard]}
+            source_path = a.data_dir/f'source_batch_{batch:03d}.json'
+            source_path.write_text(json.dumps(provenance, indent=2))
+    archives = [a.data_dir/shard for shard in shards]
+    prepare(a.data_dir, archives, a.output, a.seed, a.max_length, a.min_aspect_ratio)
+    sources = []
+    for batch in batches:
+        provenance = a.data_dir/f'source_batch_{batch:03d}.json'
+        if provenance.exists():
+            sources.append((provenance, json.loads(provenance.read_text())))
+    if len(sources) == 1:
+        shutil.copyfile(sources[0][0], a.output/'dataset_source.json')
+    elif sources:
+        (a.output/'dataset_source.json').write_text(
+            json.dumps([source for _, source in sources], indent=2), encoding='utf-8')
 
 if __name__ == '__main__':
     main()
