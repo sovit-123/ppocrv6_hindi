@@ -1,37 +1,27 @@
-"""Gradio UI for testing the PP-OCRv6 Hindi recognizer.
+"""Gradio UI for testing PP-OCRv6 Hindi recognition checkpoints.
 
-Upload one or more Hindi word/line crops and press "Run inference". The two
-model routes use different artifacts:
+Upload one or more Hindi word/line crops and press "Run inference". Routes:
 
-- `finetuned` (default) runs the **exported inference model** in
-  `inference/hindi_rec/` (produced by `python run.py export`). The app
-  imports the pinned PaddleOCR checkout's recognizer
-  (`tools/infer/predict_rec.py:TextRecognizer`) in this process, loads it
-  once per device, and calls it directly per image. The Devanagari
-  dictionary travels inside the exported `inference.yml` (export embeds it),
-  so this route reads no `prepared/` or `weights/` training files. Set
-  `PPOCRV6_INFER_DIR` to point at a bundle elsewhere, e.g. one shared with
-  this repo without the training outputs.
-- `official` shells out to this project's entry point
-  `python run.py infer --model official`, which runs the stock PP-OCRv6
-  medium pretrained **training checkpoint** (Chinese/English dictionary; it
-  cannot read Devanagari) so people can compare against the pretrained model.
-  run.py rewrites `predictions.txt` on every call; this app parses that file
-  for display.
+- `checkpoint` runs a portable fine-tuned training checkpoint through
+  `python run.py infer --checkpoint`, separately per image. No export or
+  original prepared dataset is required. Supply the checkpoint with
+  `python gradio_app.py --checkpoint /path/to/best_accuracy.pdparams`.
+- `finetuned` runs the exported inference model in-process and caches it per
+  device. Use `python gradio_app.py --inference-dir /path/to/inference`, or the
+  default `output/hindi_rec_medium/inference/`. `PPOCRV6_INFER_DIR` remains
+  supported. The dictionary is embedded in `inference.yml`.
+- `official` shells out to `run.py infer --model official` for the stock
+  Chinese/English medium checkpoint, which cannot read Devanagari.
 
-The official route never imports Paddle in this process; the finetuned route
-imports Paddle lazily, on first use, and never calls any other run.py mode.
-Nothing is trained or modified here.
+Both dynamic routes rewrite `predictions.txt`; this app parses the final row.
+Only the exported route imports Paddle in this process. Nothing is trained.
 
-Run it with the same Python environment used for run.py, plus gradio
-(`python -m pip install gradio`; opencv-python is already part of
-requirements-training.txt):
-
-    python gradio_app.py
-
+Run with the same Python environment used for run.py, plus gradio
+(`python -m pip install gradio`; opencv-python is in requirements-training.txt).
 `launch()` binds to 127.0.0.1:7860 by default; set GRADIO_SERVER_NAME and
 GRADIO_SERVER_PORT to expose it elsewhere.
 """
+import argparse
 import os
 import subprocess
 import sys
@@ -47,8 +37,9 @@ ROOT = Path(__file__).resolve().parent
 RUN_PY = ROOT / 'run.py'
 PREDICTIONS = ROOT / 'predictions.txt'
 PADDLE_ROOT = ROOT / 'third_party' / 'PaddleOCR'
-INFER_DIR = Path(os.environ.get('PPOCRV6_INFER_DIR', ROOT / 'inference' / 'hindi_rec'))
-COMMAND_TIMEOUT = 600  # seconds per official-route image, model load included
+INFER_DIR = Path(os.environ.get('PPOCRV6_INFER_DIR', ROOT / 'output' / 'hindi_rec_medium' / 'inference'))
+CHECKPOINT = None
+COMMAND_TIMEOUT = 600  # seconds per dynamic-route image, model load included
 _RECOGNIZERS = {}  # device -> TextRecognizer built from the exported bundle
 
 
@@ -69,7 +60,7 @@ def stage_png(source, work, index):
 def read_last_prediction():
     """Return (text, score) from the last `predictions.txt` row.
 
-    run.py truncates and rewrites the file per official infer call, so the
+    run.py truncates and rewrites the file per dynamic infer call, so the
     last row is always the image just processed. Rows look like:
     `<image path>\t<predicted text>\t<score>`.
     """
@@ -106,6 +97,24 @@ def exported_bundle_problem():
     return None
 
 
+def checkpoint_bundle_problem():
+    """Return a user-facing error for an incomplete portable checkpoint bundle."""
+    if CHECKPOINT is None:
+        return 'Pass `--checkpoint /path/to/checkpoint.pdparams` to use the checkpoint route.'
+    prefix = str(CHECKPOINT).removesuffix('.pdparams')
+    checkpoint = Path(prefix + '.pdparams')
+    if not checkpoint.is_file():
+        return f'Missing checkpoint {checkpoint}'
+    for name in ('checkpoint_config.yml', 'hindi_dict.txt', 'initialization.json'):
+        path = checkpoint.parent / name
+        if not path.is_file():
+            return f'Missing portable checkpoint file {path}'
+    if not PADDLE_ROOT.is_dir():
+        return (f'Missing the pinned PaddleOCR checkout at {PADDLE_ROOT}; '
+                'run `python run.py setup` first.')
+    return None
+
+
 def load_recognizer(device):
     """Return the pinned-checkout recognizer for the exported bundle.
 
@@ -116,7 +125,7 @@ def load_recognizer(device):
     """
     problem = exported_bundle_problem()
     if problem:
-        raise gradio.Error(problem)
+        raise gr.Error(problem)
     if device not in _RECOGNIZERS:
         if str(PADDLE_ROOT) not in sys.path:
             sys.path.insert(0, str(PADDLE_ROOT))
@@ -151,10 +160,8 @@ def infer_finetuned(source, staged, device):
     return [source.name, text, f'{score:.4f}', 'ok'], log
 
 
-def infer_official(source, staged, device):
-    """Run `run.py infer --model official` for one staged image (stock weights)."""
-    command = [sys.executable, str(RUN_PY), 'infer', '--model', 'official',
-               '--image', str(staged), '--device', device]
+def infer_subprocess(source, command):
+    """Run one dynamic inference command and parse its prediction row."""
     log = ['+ ' + ' '.join(command)]
     try:
         done = subprocess.run(command, cwd=ROOT, capture_output=True, encoding='utf-8',
@@ -175,14 +182,33 @@ def infer_official(source, staged, device):
     return [source.name, text, score, 'ok'], log
 
 
+def infer_official(source, staged, device):
+    """Run `run.py infer --model official` for one staged image (stock weights)."""
+    command = [sys.executable, str(RUN_PY), 'infer', '--model', 'official',
+               '--image', str(staged), '--device', device]
+    return infer_subprocess(source, command)
+
+
+def infer_checkpoint(source, staged, device):
+    """Run one staged image through a portable fine-tuned training checkpoint."""
+    command = [sys.executable, str(RUN_PY), 'infer', '--checkpoint', str(CHECKPOINT),
+               '--image', str(staged), '--device', device]
+    return infer_subprocess(source, command)
+
+
 def infer_uploads(files, model, device):
     """Predict every uploaded image, streaming results out row by row."""
     sources = [Path(f) for f in (files or [])]
     if not sources:
         raise gr.Error('Upload at least one Hindi crop image first.')
-    model, device = model or 'finetuned', device or 'gpu'
+    model = model or ('checkpoint' if CHECKPOINT is not None else 'finetuned')
+    device = device or 'gpu'
     if model == 'finetuned':
         load_recognizer(device)  # fail fast on a missing bundle before staging
+    elif model == 'checkpoint':
+        problem = checkpoint_bundle_problem()
+        if problem:
+            raise gr.Error(problem)
     rows, log = [], []
     with tempfile.TemporaryDirectory(prefix='ppocrv6_gradio_') as tmp:
         work = Path(tmp)
@@ -195,6 +221,8 @@ def infer_uploads(files, model, device):
             else:
                 if model == 'finetuned':
                     row, lines = infer_finetuned(source, staged, device)
+                elif model == 'checkpoint':
+                    row, lines = infer_checkpoint(source, staged, device)
                 else:
                     row, lines = infer_official(source, staged, device)
                 rows.append(row)
@@ -203,12 +231,21 @@ def infer_uploads(files, model, device):
 
 
 def build_app():
+    model_choices = ['finetuned', 'official']
+    model_default = 'finetuned'
+    if CHECKPOINT is not None:
+        model_choices.insert(0, 'checkpoint')
+        model_default = 'checkpoint'
     with gr.Blocks(title='PP-OCRv6 Hindi recognizer') as demo:
         gr.Markdown(
             '# PP-OCRv6 Hindi recognition\n'
-            'Upload Hindi word or short-line crops. Two model routes:\n\n'
-            '- **finetuned** (default): the exported Hindi inference model in '
-            '`inference/hindi_rec/` (built by `python run.py export`), run '
+            'Upload Hindi word or short-line crops. Model routes:\n\n'
+            '- **checkpoint**: a portable fine-tuned training checkpoint supplied '
+            'with `--checkpoint`; no export is required. This uses dynamic '
+            '`run.py infer` separately for each image.\n'
+            '- **finetuned**: the exported Hindi inference model in '
+            '`output/hindi_rec_medium/inference/` by default (built by '
+            '`python run.py export`; set `PPOCRV6_INFER_DIR` for another experiment), run '
             "through the pinned PaddleOCR checkout's predictor inside this "
             'app. The Devanagari dictionary is embedded in `inference.yml`.\n'
             '- **official**: the stock PP-OCRv6 medium pretrained model via '
@@ -221,10 +258,10 @@ def build_app():
             uploads = gr.File(label='Hindi crop images (multiple)',
                               file_count='multiple', file_types=['image'])
             device = gr.Radio(choices=['gpu', 'cpu'], value='gpu', label='Device')
-        model = gr.Radio(choices=['finetuned', 'official'], value='finetuned',
+        model = gr.Radio(choices=model_choices, value=model_default,
                          label='Model',
-                         info='finetuned: exported inference model (run '
-                              '`python run.py export` first). official: stock '
+                         info='checkpoint: portable fine-tuned weights without export. '
+                              'finetuned: cached exported inference model. official: stock '
                               'pretrained checkpoint via run.py.')
         run_btn = gr.Button('Run inference', variant='primary')
         results = gr.Dataframe(headers=['image', 'predicted text', 'confidence', 'status'],
@@ -238,5 +275,17 @@ def build_app():
     return demo
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--checkpoint', type=Path,
+                        help='Portable fine-tuned .pdparams checkpoint (no export required)')
+    parser.add_argument('--inference-dir', type=Path, default=INFER_DIR,
+                        help='Exported inference bundle directory')
+    return parser.parse_args()
+
+
 if __name__ == '__main__':
+    args = parse_args()
+    INFER_DIR = args.inference_dir.resolve()
+    CHECKPOINT = args.checkpoint.resolve() if args.checkpoint else None
     build_app().launch()

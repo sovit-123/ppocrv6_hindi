@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import urllib.request
@@ -16,8 +17,8 @@ DEFAULT_UPSTREAM = ROOT/'third_party/PaddleOCR'
 WEIGHTS = ROOT/'weights'
 MODEL_SIZES = ('tiny','small','medium')
 PRETRAINED_FILENAME = 'PP-OCRv6_medium_rec_pretrained.pdparams'
-URL = f'https://paddle-model-ecology.bj.bcebos.com/paddlex/official_pretrained_model/{PRETRAINED_FILENAME}'
-RESET_PREFIXES = ('head.ctc_head.fc.', 'head.gtc_head.embedding.', 'head.gtc_head.tgt_word_prj.')
+RESET_PREFIXES = ('head.ctc_head.fc.', 'head.ctc_head.fc2.',
+                  'head.gtc_head.embedding.', 'head.gtc_head.tgt_word_prj.')
 
 
 def shell(command, cwd=None):
@@ -84,8 +85,9 @@ def setup(upstream, weights=WEIGHTS, model_size='medium'):
     return original
 
 
-def config_for(upstream, data, prepared, output, checkpoint, a):
-    c = yaml.safe_load((upstream/'configs/rec/PP-OCRv6/PP-OCRv6_medium_rec.yml').read_text())
+def config_for(upstream, data, prepared, output, checkpoint, a, model_size='medium'):
+    config_name = f'PP-OCRv6_{model_size}_rec.yml'
+    c = yaml.safe_load((upstream/'configs/rec/PP-OCRv6'/config_name).read_text())
     c['Global'].update(character_dict_path=str(prepared/'hindi_dict.txt'),
         max_text_length=40, pretrained_model=str(checkpoint), checkpoints=None,
         save_model_dir=str(output), epoch_num=a.epochs, use_gpu=a.device=='gpu',
@@ -113,15 +115,27 @@ def config_for(upstream, data, prepared, output, checkpoint, a):
     return c
 
 
-def init_checkpoint(upstream, config, weights):
+def checkpoint_config_for(config):
+    """Return an inference config with no absolute training-data dependencies."""
+    c = copy.deepcopy(config)
+    c['Global'].update(character_dict_path='hindi_dict.txt',pretrained_model=None,
+                       checkpoints=None,save_model_dir='.',save_res_path='predictions.txt')
+    for split in ('Train','Eval'):
+        c[split]['dataset']['data_dir'] = '.'
+        c[split]['dataset']['label_file_list'] = []
+    return c
+
+
+def init_checkpoint(upstream, config, experiment, model_size='medium', weights=WEIGHTS):
     import paddle
     sys.path.insert(0,str(upstream))
     from ppocr.modeling.architectures import build_model
     from ppocr.postprocess import build_post_process
-    weights.mkdir(parents=True,exist_ok=True)
-    original = weights/PRETRAINED_FILENAME
+    experiment.mkdir(parents=True,exist_ok=True)
+    original = weights/pretrained_filename(model_size)
     if not original.is_file() or original.stat().st_size == 0:
-        raise ValueError(f'Missing official weights {original}; run `python run.py setup` first.')
+        raise ValueError(f'Missing official {model_size} weights {original}; '
+                         f'run `python run.py setup --model-size {model_size}` first.')
     c = copy.deepcopy(config)
     decoder = build_post_process(c['PostProcess'],c['Global'])
     n = len(decoder.character)
@@ -146,13 +160,14 @@ def init_checkpoint(upstream, config, weights):
             loaded.append(key)
     if not reset or not any(k.startswith('backbone.') for k in loaded) or mismatch or missing:
         raise ValueError(f'Unexpected checkpoint layout: reset={reset}, mismatch={mismatch}, missing={missing}')
-    adapted = weights/'hindi_initialized.pdparams'
+    adapted = experiment/'hindi_initialized.pdparams'
     paddle.save(target,str(adapted))
-    report = {'source_url':URL,'source_sha256':hashlib.sha256(original.read_bytes()).hexdigest(),
+    report = {'model_size':model_size,'source_url':pretrained_url(model_size),
+              'source_sha256':hashlib.sha256(original.read_bytes()).hexdigest(),
               'paddle_version':paddle.__version__, 'paddleocr_commit':PADDLE_REF,
               'loaded':loaded,'reset_vocabulary_parameters':reset,'ctc_classes':n,
               'dictionary_sha256':hashlib.sha256(Path(config['Global']['character_dict_path']).read_bytes()).hexdigest()}
-    (weights/'initialization.json').write_text(json.dumps(report,indent=2))
+    (experiment/'initialization.json').write_text(json.dumps(report,indent=2))
     # Actual training/eval forwards catch source/API/geometry incompatibilities.
     x = paddle.randn([2,3,48,320])
     model.train()
@@ -166,15 +181,88 @@ def init_checkpoint(upstream, config, weights):
     return adapted
 
 
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with path.open('rb') as f:
+        for chunk in iter(lambda: f.read(1024*1024),b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def subset_for(source, experiment, split, count):
+    """Create and verify a deterministic first-N view of a prepared label file."""
+    if count < 1:
+        raise ValueError('Subset size must be positive.')
+    source = source.resolve()
+    with source.open(encoding='utf-8') as f:
+        total = sum(1 for line in f if line.strip())
+    if count > total:
+        raise ValueError(f'Requested {count} {split} samples, but {source} has only {total}.')
+    source_hash = file_sha256(source)
+    subset = experiment/'subsets'/f'{split}_{count}.txt'
+    metadata_path = subset.with_suffix('.json')
+    expected = {'source_label_file':str(source),'source_sha256':source_hash,
+                'source_rows':total,'split':split,'requested_count':count,
+                'actual_count':count,'selection_rule':'first_n_of_prepared_shuffle'}
+    if subset.exists() or metadata_path.exists():
+        if not subset.is_file() or not metadata_path.is_file():
+            raise ValueError(f'Incomplete subset artifacts: {subset} and {metadata_path}')
+        saved = json.loads(metadata_path.read_text(encoding='utf-8'))
+        if any(saved.get(key) != value for key,value in expected.items()):
+            raise ValueError(f'Subset metadata does not match its source: {metadata_path}')
+        if file_sha256(subset) != saved.get('subset_sha256'):
+            raise ValueError(f'Subset hash mismatch: {subset}')
+        return subset
+    subset.parent.mkdir(parents=True,exist_ok=True)
+    temp = subset.with_suffix('.part')
+    rows = 0
+    with source.open(encoding='utf-8') as src, temp.open('w',encoding='utf-8',newline='') as out:
+        for line in src:
+            if not line.strip():
+                continue
+            out.write(line if line.endswith('\n') else line+'\n')
+            rows += 1
+            if rows == count:
+                break
+    if rows != count:
+        raise ValueError(f'Only {rows} rows could be written for {subset}.')
+    temp.replace(subset)
+    metadata = dict(expected,subset_sha256=file_sha256(subset))
+    metadata_temp = metadata_path.with_suffix('.part')
+    metadata_temp.write_text(json.dumps(metadata,indent=2),encoding='utf-8')
+    metadata_temp.replace(metadata_path)
+    return subset
+
+
+def verify_subset(subset):
+    """Verify a configured subset and its original prepared source before resume."""
+    subset = subset.resolve()
+    metadata_path = subset.with_suffix('.json')
+    if not subset.is_file() or not metadata_path.is_file():
+        raise ValueError(f'Missing subset or metadata: {subset} and {metadata_path}')
+    metadata = json.loads(metadata_path.read_text(encoding='utf-8'))
+    source = Path(metadata['source_label_file'])
+    if file_sha256(source) != metadata['source_sha256']:
+        raise ValueError(f'Prepared source changed after subset creation: {source}')
+    if file_sha256(subset) != metadata['subset_sha256']:
+        raise ValueError(f'Subset hash mismatch: {subset}')
+    return subset
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('action',choices=['setup','configure','train','eval','test','export','infer'])
     p.add_argument('--upstream',type=Path,default=DEFAULT_UPSTREAM)
     p.add_argument('--model-size',choices=MODEL_SIZES,default='medium',
-                   help='Official model weights to download during setup')
+                   help='Model variant to download during setup or configure')
     p.add_argument('--data-dir',type=Path,default=ROOT/'data')
     p.add_argument('--prepared',type=Path,default=ROOT/'prepared')
-    p.add_argument('--output',type=Path,default=ROOT/'output/hindi_rec')
+    p.add_argument('--output',type=Path,
+                   help='Experiment directory (default: output/hindi_rec_<model-size>)')
+    p.add_argument('--num-samples',type=int,
+                   help='Use exactly N deterministic training rows for this run')
+    p.add_argument('--num-eval-samples',type=int,
+                   help='Use exactly N deterministic validation rows for this run')
     p.add_argument('--batch-size',type=int,default=16)
     p.add_argument('--workers',type=int,default=2)
     p.add_argument('--epochs',type=int,default=30)
@@ -187,29 +275,45 @@ def main():
     p.add_argument('--model',choices=['finetuned','official'],default='finetuned',
                    help='infer weights: fine-tuned Hindi checkpoint or official pretrained')
     a = p.parse_args()
-    for key in ('upstream','data_dir','prepared','output'):
+    for key in ('upstream','data_dir','prepared'):
         setattr(a,key,getattr(a,key).resolve())
+    a.output = (a.output or ROOT/'output'/f'hindi_rec_{a.model_size}').resolve()
     if min(a.batch_size,a.epochs,a.eval_every)<=0 or a.workers<0 or a.lr<=0:
         p.error('Invalid training arguments')
+    for value in (a.num_samples,a.num_eval_samples):
+        if value is not None and value <= 0:
+            p.error('Sample counts must be positive')
     if a.model=='official' and a.action!='infer':
         p.error('--model official is only valid with infer')
-    if a.model_size!='medium' and a.action!='setup':
-        p.error('--model-size is currently only valid with setup')
+    if a.model_size!='medium' and a.action not in ('setup','configure'):
+        p.error('--model-size is only valid with setup and configure; use --output to select an experiment')
+    if a.action!='train' and (a.num_samples is not None or a.num_eval_samples is not None):
+        p.error('--num-samples and --num-eval-samples are only valid with train')
+    if a.resume and (a.num_samples is not None or a.num_eval_samples is not None):
+        p.error('Resume uses the saved effective configuration; do not change sample counts')
     if a.action=='setup':
         setup(a.upstream,model_size=a.model_size); return
-    config_path = a.prepared/'hindi_rec.yml'
+    config_path = a.output/'train_config.yml'
     if a.action=='configure':
-        setup(a.upstream)
+        setup(a.upstream,model_size=a.model_size)
         report = json.loads((a.prepared/'report.json').read_text())
         if any(report['out_of_vocabulary'].values()):
             raise ValueError('Resolve out-of-vocabulary held-out labels before training.')
         for split in ('train','val','test'):
             if not (a.prepared/f'{split}.txt').is_file():
                 raise ValueError(f'Missing {split}.txt')
-        c = config_for(a.upstream,a.data_dir,a.prepared,a.output,WEIGHTS/'hindi_initialized.pdparams',a)
-        adapted = init_checkpoint(a.upstream,c,WEIGHTS)
+        initialized = a.output/'hindi_initialized.pdparams'
+        c = config_for(a.upstream,a.data_dir,a.prepared,a.output,initialized,a,a.model_size)
+        adapted = init_checkpoint(a.upstream,c,a.output,a.model_size)
         c['Global']['pretrained_model'] = str(adapted)
-        config_path.write_text(yaml.safe_dump(c,sort_keys=False,allow_unicode=True))
+        config_path.write_text(yaml.safe_dump(c,sort_keys=False,allow_unicode=True),encoding='utf-8')
+        portable = checkpoint_config_for(c)
+        (a.output/'checkpoint_config.yml').write_text(
+            yaml.safe_dump(portable,sort_keys=False,allow_unicode=True),encoding='utf-8')
+        source_dict = a.prepared/'hindi_dict.txt'
+        bundled_dict = a.output/'hindi_dict.txt'
+        if source_dict.resolve() != bundled_dict.resolve():
+            shutil.copyfile(source_dict,bundled_dict)
         print(f'Wrote {config_path}'); return
     if a.action=='infer' and a.model=='official':
         # Stock zh/en weights on the pinned upstream config. The Hindi dictionary,
@@ -229,23 +333,66 @@ def main():
             'Global.checkpoints=null',
             f'Global.pretrained_model={str(weights).removesuffix(".pdparams")}',
             f'Global.infer_img={a.image.resolve()}', f'Global.save_res_path={ROOT/"predictions.txt"}']
+    elif a.action=='infer' and a.checkpoint:
+        prefix = str(a.checkpoint.resolve()).removesuffix('.pdparams')
+        checkpoint = Path(prefix+'.pdparams')
+        if not checkpoint.is_file():
+            p.error(f'Missing checkpoint {checkpoint}')
+        bundle = checkpoint.parent
+        config_path = bundle/'checkpoint_config.yml'
+        dictionary = bundle/'hindi_dict.txt'
+        initialization = bundle/'initialization.json'
+        for required in (config_path,dictionary,initialization):
+            if not required.is_file():
+                p.error(f'Missing portable checkpoint file {required}')
+        if not a.image:
+            p.error('--image is required for infer')
+        init = json.loads(initialization.read_text(encoding='utf-8'))
+        if file_sha256(dictionary) != init['dictionary_sha256']:
+            raise ValueError('Bundled dictionary does not match initialization metadata.')
+        tool = 'infer_rec.py'
+        overrides = [f'Global.use_gpu={a.device=="gpu"}',
+            f'Global.pretrained_model={prefix}', 'Global.checkpoints=null',
+            f'Global.character_dict_path={dictionary}',
+            f'Global.infer_img={a.image.resolve()}', f'Global.save_res_path={ROOT/"predictions.txt"}']
     else:
         if not config_path.exists():
-            p.error('Run configure first.')
-        c = yaml.safe_load(config_path.read_text())
-        current_hash = hashlib.sha256((a.prepared/'hindi_dict.txt').read_bytes()).hexdigest()
-        init = json.loads((WEIGHTS/'initialization.json').read_text())
+            p.error(f'Missing {config_path}; run configure first.')
+        if a.action=='train' and a.resume:
+            config_path = a.output/'effective_train_config.yml'
+            if not config_path.is_file():
+                p.error(f'Missing {config_path}; cannot verify the original training configuration.')
+        c = yaml.safe_load(config_path.read_text(encoding='utf-8'))
+        dictionary = Path(c['Global']['character_dict_path'])
+        current_hash = file_sha256(dictionary)
+        init = json.loads((a.output/'initialization.json').read_text(encoding='utf-8'))
         if current_hash != init['dictionary_sha256']:
-            raise ValueError('Dictionary changed; use a separate project/run and reconfigure.')
+            raise ValueError('Dictionary changed; use a separate experiment and reconfigure.')
         overrides = [f'Global.use_gpu={a.device=="gpu"}']
         if a.action=='train':
             tool='train.py'
             if a.resume:
+                for mode in ('Train','Eval'):
+                    for label in c[mode]['dataset']['label_file_list']:
+                        label_path = Path(label).resolve()
+                        if label_path.parent == (a.output/'subsets').resolve():
+                            verify_subset(label_path)
                 prefix=str(a.resume.resolve()).removesuffix('.pdparams')
                 for ext in ('.pdparams','.pdopt','.states'):
                     if not Path(prefix+ext).exists():
                         raise ValueError(f'Missing resume file: {prefix+ext}')
                 overrides += [f'Global.checkpoints={prefix}']
+            else:
+                if a.num_samples is not None:
+                    source = Path(c['Train']['dataset']['label_file_list'][0])
+                    subset = subset_for(source,a.output,'train',a.num_samples)
+                    c['Train']['dataset']['label_file_list'] = [str(subset)]
+                if a.num_eval_samples is not None:
+                    source = Path(c['Eval']['dataset']['label_file_list'][0])
+                    subset = subset_for(source,a.output,'val',a.num_eval_samples)
+                    c['Eval']['dataset']['label_file_list'] = [str(subset)]
+                config_path = a.output/'effective_train_config.yml'
+                config_path.write_text(yaml.safe_dump(c,sort_keys=False,allow_unicode=True),encoding='utf-8')
         else:
             checkpoint = a.checkpoint or Path(c['Global']['save_model_dir'])/'best_accuracy'
             prefix = str(checkpoint.resolve()).removesuffix('.pdparams')
@@ -254,9 +401,10 @@ def main():
             overrides += [f'Global.pretrained_model={prefix}', 'Global.checkpoints=null']
             tool={'eval':'eval.py','test':'eval.py','export':'export_model.py','infer':'infer_rec.py'}[a.action]
             if a.action=='test':
-                overrides += [f'Eval.dataset.label_file_list=[{json.dumps(str(a.prepared/"test.txt"))}]']
+                test_labels = Path(c['Eval']['dataset']['label_file_list'][0]).with_name('test.txt')
+                overrides += [f'Eval.dataset.label_file_list=[{json.dumps(str(test_labels))}]']
             if a.action=='export':
-                overrides += [f'Global.save_inference_dir={ROOT/"inference/hindi_rec"}']
+                overrides += [f'Global.save_inference_dir={a.output/"inference"}']
             if a.action=='infer':
                 if not a.image:
                     p.error('--image is required for infer')

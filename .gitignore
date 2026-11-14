@@ -6,6 +6,8 @@ weights/
 output/
 inference/
 predictions.txt
+shared/
+shared*
 
 # Python
 __pycache__/
