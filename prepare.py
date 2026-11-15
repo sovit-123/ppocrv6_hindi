@@ -13,6 +13,8 @@ USAGE:
 --batch remains compatible with the original single-archive workflow. Use a
 fresh output directory for every preparation run. --all-batches downloads all
 42 archives and requires substantial disk space.
+
+Run `python run.py setup` before using this CLI, including with --offline.
 """
 import argparse
 from collections import Counter
@@ -217,6 +219,11 @@ def main():
     batches.sort()
     shards = [f'data/images_batch_{batch:03d}.tar.gz' for batch in batches]
     a.data_dir = a.data_dir.resolve(); a.output = a.output.resolve()
+    from run import require_setup
+    try:
+        require_setup()
+    except ValueError as exc:
+        p.error(str(exc))
     if not a.offline:
         from huggingface_hub import HfApi, hf_hub_download
         revision = HfApi().dataset_info(REPO).sha
