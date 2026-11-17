@@ -132,6 +132,21 @@ Only images from that selected archive are eligible, even if other images exist
 on disk. Other tarballs are never downloaded automatically. Annotation orphans
 and records referring to other shards do not become samples.
 
+Each archive extracts into its own directory:
+
+```text
+data/devanagari_ocr/images_batch_001/
+data/devanagari_ocr/images_batch_002/
+...
+```
+
+Label paths include the same archive directory. Samples are sorted by basename
+before the existing seed-42 global shuffle, so moving from the old flat layout
+to `per_archive` preserves split image identities and first-N subset selection.
+Use a fresh prepared-output directory. Existing flat-layout experiments remain
+usable while their original flat images are retained; new label hashes differ
+because the paths contain archive directories.
+
 Open these files before proceeding:
 
 - `prepared/report.json`: counts by split and prefix; rejected labels/images;
@@ -143,8 +158,8 @@ Open these files before proceeding:
 Example label rows (the gap is a tab):
 
 ```text
-devanagari_ocr/hindi_local_123.png	भारत एक देश है।
-devanagari_ocr/hindidataocr_456.png	हिन्दी
+devanagari_ocr/images_batch_001/hindi_local_123.png	भारत एक देश है।
+devanagari_ocr/images_batch_002/hindidataocr_456.png	हिन्दी
 ```
 
 These paths are relative to `--data-dir`, not the prepared directory. Spaces
@@ -446,6 +461,13 @@ respective terms and credit the underlying source datasets for published work.
 This project's code is provided under Apache-2.0 (see LICENSE).
 
 ## Update log
+
+### 2026-11-16
+
+- Preparation now extracts each archive into `devanagari_ocr/images_batch_NNN/`
+  and writes matching nested label paths. Basename sorting before the global
+  seed-42 shuffle preserves the flat layout's split identities and deterministic
+  first-N subset selection.
 
 ### 2026-11-14
 

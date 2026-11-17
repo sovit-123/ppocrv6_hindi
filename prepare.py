@@ -1,8 +1,9 @@
 """Download selected shards, extract supported Hindi crops, stream labels, and split.
 
 The selected sources are hindi_local, iiit_hindi, hindidataocr, and kaggle.
-Nepali annotations are excluded. The shared annotation file is downloaded once
-and scanned once, regardless of the number of selected image archives.
+Nepali annotations are excluded. Each archive extracts into its own
+`devanagari_ocr/images_batch_NNN/` directory. The shared annotation file is
+downloaded once and scanned once, regardless of the number of selected archives.
 
 USAGE:
     python prepare.py --batch 1
@@ -53,10 +54,12 @@ def annotations(path):
 
 
 def extract(tarpath, target, prefixes, names=None):
-    """Extract selected images and reject duplicate basenames across archives."""
+    """Extract into an archive directory and track basename-to-archive mappings."""
+    archive_id = tarpath.name.removesuffix('.tar.gz')
+    target = target / archive_id
     target.mkdir(parents=True, exist_ok=True)
     if names is None:
-        names = set()
+        names = {}
     with tarfile.open(tarpath, 'r|gz') as archive:
         for member in archive:
             name = Path(member.name).name
@@ -64,7 +67,7 @@ def extract(tarpath, target, prefixes, names=None):
                 continue
             if name in names:
                 raise ValueError(f'Duplicate selected image basename: {name} ({tarpath.name})')
-            names.add(name)
+            names[name] = archive_id
             source = archive.extractfile(member)
             with source, (target / name).open('wb') as out:
                 shutil.copyfileobj(source, out)
@@ -96,7 +99,7 @@ def prepare(data, archives, out, seed=42, max_length=40, min_ratio=1.0):
         raise ValueError('Select at least one image archive.')
     if len(set(archives)) != len(archives):
         raise ValueError('Each image archive may be selected only once.')
-    names = set()
+    names = {}
     for archive in archives:
         extract(archive, data / 'devanagari_ocr', PREFIXES, names)
     stats = Counter(extracted_hindi=len(names))
@@ -126,7 +129,7 @@ def prepare(data, archives, out, seed=42, max_length=40, min_ratio=1.0):
         if len(text) > max_length or ctc_steps(text) > 40:
             stats['too_long_for_ctc'] += 1
             continue
-        image_path = data / 'devanagari_ocr' / name
+        image_path = data / 'devanagari_ocr' / names[name] / name
         try:
             with Image.open(image_path) as im:
                 im.load()
@@ -144,14 +147,16 @@ def prepare(data, archives, out, seed=42, max_length=40, min_ratio=1.0):
             stats['duplicate_image'] += 1
             continue
         digests.add(digest)
-        samples.append((f'devanagari_ocr/{name}', text))
-    samples.sort()
+        samples.append((f'devanagari_ocr/{names[name]}/{name}', text))
+    # Preserve flat-layout split identities: basenames, not batch directories,
+    # determine ordering before the same seeded global shuffle.
+    samples.sort(key=lambda row: (Path(row[0]).name, row[1]))
     random.Random(seed).shuffle(samples)
     n = len(samples)
     n_test = round(n * .1)
     n_val = round(n * .1)
     stats['matched_annotation_images'] = len(seen)
-    stats['orphan_images'] = len(names - seen)
+    stats['orphan_images'] = len(names.keys() - seen)
     if min(n_test, n_val, n - n_test - n_val) < 1:
         print(json.dumps(dict(stats), indent=2))
         raise ValueError(f'Only {n} usable Hindi samples in the selected archives.')
@@ -171,7 +176,7 @@ def prepare(data, archives, out, seed=42, max_length=40, min_ratio=1.0):
             (out / f'{split}.txt').write_text(''.join(f'{p}\t{t}\n' for p,t in rows), encoding='utf-8')
             writer.writerows((p, split) for p, _ in rows)
     oov = {s: sorted(set(''.join(t for _,t in rows)) - vocab) for s,rows in splits.items()}
-    report = {'seed': seed,
+    report = {'seed': seed, 'layout': 'per_archive',
               'archives': [{'name': archive.name, 'bytes': archive.stat().st_size}
                            for archive in archives],
               'prefixes': PREFIXES, 'stats': dict(stats), 'counts': {s: len(r) for s,r in splits.items()},

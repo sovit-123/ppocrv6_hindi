@@ -2,6 +2,7 @@ import importlib
 import io
 import json
 from pathlib import Path
+import random
 import sys
 import tarfile
 import tempfile
@@ -48,6 +49,39 @@ class PipelineTest(unittest.TestCase):
             self.assertEqual(ctc_steps('क्क'),3)
             self.assertEqual(ctc_steps('कक'),3)
             with self.assertRaises(ValueError): prepare(data,tar,root/'out')
+
+    def test_multi_archive_layout_preserves_flat_split_identities(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); data=root/'data'; data.mkdir(); archives=[]; records=[]; expected=[]
+            for batch in (1,2):
+                tar=data/f'images_batch_{batch:03d}.tar.gz'; archives.append(tar)
+                with tarfile.open(tar,'w:gz') as f:
+                    for i in range((batch-1)*15,batch*15):
+                        name=f'hindi_local_{i}.png'; text='हिन्दी पाठ'
+                        im=Image.new('RGB',(80,20),(i,100,200))
+                        b=io.BytesIO(); im.save(b,format='PNG'); raw=b.getvalue()
+                        member=tarfile.TarInfo('nested/'+name); member.size=len(raw)
+                        f.addfile(member,io.BytesIO(raw))
+                        records.append({'images':['devanagari_ocr/'+name],
+                                        'messages':[{'role':'assistant','content':text}]})
+                        expected.append((f'devanagari_ocr/{name}',text))
+            (data/'devanagari_ocr.json').write_text(json.dumps(records,ensure_ascii=False))
+            prepare(data,archives,root/'out')
+            expected.sort()
+            random.Random(42).shuffle(expected)
+            expected_splits={'test':expected[:3],'val':expected[3:6],'train':expected[6:]}
+            for split,rows in expected_splits.items():
+                actual=(root/'out'/f'{split}.txt').read_text(encoding='utf-8').splitlines()
+                self.assertEqual([Path(line.split('\t',1)[0]).name for line in actual],
+                                 [Path(path).name for path,_ in rows])
+            for i in range(30):
+                batch=1 if i<15 else 2
+                relative=Path(f'devanagari_ocr/images_batch_{batch:03d}/hindi_local_{i}.png')
+                self.assertTrue((data/relative).is_file())
+                self.assertFalse((data/f'devanagari_ocr/hindi_local_{i}.png').exists())
+            report=json.loads((root/'out/report.json').read_text())
+            self.assertEqual(report['layout'],'per_archive')
+            self.assertEqual(report['stats']['orphan_images'],0)
 
     def test_stream_array_and_jsonl(self):
         with tempfile.TemporaryDirectory() as t:
