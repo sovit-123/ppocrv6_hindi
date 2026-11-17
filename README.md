@@ -140,8 +140,10 @@ data/devanagari_ocr/images_batch_002/
 ...
 ```
 
-Label paths include the same archive directory. Samples are sorted by basename
-before the existing seed-42 global shuffle, so moving from the old flat layout
+A `tqdm.auto` progress bar shows the archive currently being extracted and the
+number of completed archives. Label paths include the same archive directory.
+Samples are sorted by basename before the existing seed-42 global shuffle, so
+moving from the old flat layout
 to `per_archive` preserves split image identities and first-N subset selection.
 Use a fresh prepared-output directory. Existing flat-layout experiments remain
 usable while their original flat images are retained; new label hashes differ
@@ -461,6 +463,11 @@ respective terms and credit the underlying source datasets for published work.
 This project's code is provided under Apache-2.0 (see LICENSE).
 
 ## Update log
+
+### 2026-11-17
+
+- Multi-archive extraction now uses `tqdm.auto` to display the current archive
+  filename and completed archive count. `tqdm` is included in base requirements.
 
 ### 2026-11-16
 

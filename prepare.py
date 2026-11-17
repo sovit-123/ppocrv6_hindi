@@ -29,6 +29,7 @@ import tarfile
 import unicodedata
 
 from PIL import Image, ImageDraw
+from tqdm.auto import tqdm
 
 PREFIXES = ('hindi_local', 'iiit_hindi', 'hindidataocr', 'kaggle')
 REPO = 'himalaya-ai/devanagari_ocr_dataset'
@@ -100,8 +101,11 @@ def prepare(data, archives, out, seed=42, max_length=40, min_ratio=1.0):
     if len(set(archives)) != len(archives):
         raise ValueError('Each image archive may be selected only once.')
     names = {}
-    for archive in archives:
-        extract(archive, data / 'devanagari_ocr', PREFIXES, names)
+    with tqdm(archives, desc='Extracting archives', unit='archive') as progress:
+        for archive in progress:
+            progress.set_description(f'Extracting {archive.name}')
+            extract(archive, data / 'devanagari_ocr', PREFIXES, names)
+        progress.set_description('Archives extracted')
     stats = Counter(extracted_hindi=len(names))
     samples, seen, digests = [], set(), set()
     for record in annotations(data / 'devanagari_ocr.json'):
