@@ -140,9 +140,17 @@ data/devanagari_ocr/images_batch_002/
 ...
 ```
 
-A `tqdm.auto` progress bar shows the archive currently being extracted and the
-number of completed archives. Label paths include the same archive directory.
-Samples are sorted by basename before the existing seed-42 global shuffle, so
+A `tqdm.auto` progress bar shows whether each archive is being reused or
+extracted, plus the completed archive count. Extraction is interruption-safe:
+each batch is first written to `images_batch_NNN.part/`, then marked complete and
+atomically renamed. Later runs validate the marker, archive metadata, and file
+count before reusing a batch. Incomplete batches are reported, removed, and
+re-extracted; completed batches are not modified. Existing directories without
+markers are conservatively re-extracted once. Skipped batches are scanned to
+rebuild the basename mapping, so global splits and subsets remain unchanged.
+
+Label paths include the same archive directory. Samples are sorted by basename
+before the existing seed-42 global shuffle, so
 moving from the old flat layout
 to `per_archive` preserves split image identities and first-N subset selection.
 Use a fresh prepared-output directory. Existing flat-layout experiments remain
@@ -463,6 +471,13 @@ respective terms and credit the underlying source datasets for published work.
 This project's code is provided under Apache-2.0 (see LICENSE).
 
 ## Update log
+
+### 2026-11-18
+
+- Archive extraction is now resumable. Batches are extracted into `.part`
+  directories, marked complete, and atomically renamed. Later runs reuse valid
+  completed batches and remove/re-extract incomplete ones while rebuilding the
+  full basename mapping for unchanged shuffle and subset behavior.
 
 ### 2026-11-17
 

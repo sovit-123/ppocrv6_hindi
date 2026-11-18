@@ -3,6 +3,7 @@ import io
 import json
 from pathlib import Path
 import random
+import shutil
 import sys
 import tarfile
 import tempfile
@@ -82,6 +83,49 @@ class PipelineTest(unittest.TestCase):
             report=json.loads((root/'out/report.json').read_text())
             self.assertEqual(report['layout'],'per_archive')
             self.assertEqual(report['stats']['orphan_images'],0)
+
+    def test_extraction_reuses_complete_and_replaces_interrupted_batches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); data=root/'data'; data.mkdir(); archives=[]; records=[]
+            for batch in (1,2):
+                tar=data/f'images_batch_{batch:03d}.tar.gz'; archives.append(tar)
+                with tarfile.open(tar,'w:gz') as f:
+                    for i in range((batch-1)*15,batch*15):
+                        name=f'hindi_local_{i}.png'
+                        im=Image.new('RGB',(80,20),(i,100,200))
+                        b=io.BytesIO(); im.save(b,format='PNG'); raw=b.getvalue()
+                        member=tarfile.TarInfo(name); member.size=len(raw)
+                        f.addfile(member,io.BytesIO(raw))
+                        records.append({'images':[name],
+                                        'messages':[{'role':'assistant','content':'हिन्दी पाठ'}]})
+            (data/'devanagari_ocr.json').write_text(json.dumps(records,ensure_ascii=False))
+            prepare(data,archives,root/'out1')
+            expected_train=(root/'out1/train.txt').read_bytes()
+            completed=data/'devanagari_ocr/images_batch_001/hindi_local_0.png'
+            original_mtime=completed.stat().st_mtime_ns
+            with mock.patch('prepare.shutil.rmtree',wraps=shutil.rmtree) as remove:
+                prepare(data,archives,root/'out2')
+                remove.assert_not_called()
+            self.assertEqual(completed.stat().st_mtime_ns,original_mtime)
+            self.assertEqual((root/'out2/train.txt').read_bytes(),expected_train)
+            final=data/'devanagari_ocr/images_batch_002'
+            (final/'.extract_complete.json').unlink()
+            (final/'hindi_local_15.png').unlink()
+            (final/'hindi_local_stale.png').write_bytes(b'stale')
+            part=data/'devanagari_ocr/images_batch_002.part'
+            part.mkdir(); (part/'partial.png').write_bytes(b'partial')
+            with mock.patch('prepare.shutil.rmtree',wraps=shutil.rmtree) as remove:
+                prepare(data,archives,root/'out3')
+                removed={call.args[0] for call in remove.call_args_list}
+                self.assertIn(part,removed)
+                self.assertIn(final,removed)
+            self.assertEqual(completed.stat().st_mtime_ns,original_mtime)
+            self.assertTrue((final/'hindi_local_15.png').is_file())
+            self.assertFalse((final/'hindi_local_stale.png').exists())
+            self.assertFalse(part.exists())
+            marker=json.loads((final/'.extract_complete.json').read_text())
+            self.assertEqual(marker['extracted_files'],15)
+            self.assertEqual((root/'out3/train.txt').read_bytes(),expected_train)
 
     def test_stream_array_and_jsonl(self):
         with tempfile.TemporaryDirectory() as t:

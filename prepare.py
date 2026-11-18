@@ -2,8 +2,9 @@
 
 The selected sources are hindi_local, iiit_hindi, hindidataocr, and kaggle.
 Nepali annotations are excluded. Each archive extracts into its own
-`devanagari_ocr/images_batch_NNN/` directory. The shared annotation file is
-downloaded once and scanned once, regardless of the number of selected archives.
+`devanagari_ocr/images_batch_NNN/` directory. Complete batches are reused on
+later runs; incomplete batches are safely replaced. The shared annotation file
+is downloaded once and scanned once, regardless of the number of archives.
 
 USAGE:
     python prepare.py --batch 1
@@ -54,24 +55,84 @@ def annotations(path):
                     yield json.loads(line)
 
 
-def extract(tarpath, target, prefixes, names=None):
-    """Extract into an archive directory and track basename-to-archive mappings."""
+def archive_layout(tarpath, target):
     archive_id = tarpath.name.removesuffix('.tar.gz')
-    target = target / archive_id
-    target.mkdir(parents=True, exist_ok=True)
+    if not archive_id or archive_id in ('.','..'):
+        raise ValueError(f'Unsafe archive directory name: {archive_id!r}')
+    return archive_id, target/archive_id, target/f'{archive_id}.part'
+
+
+def completed_archive_files(tarpath, target, prefixes):
+    """Return selected filenames for a valid completed extraction, else None."""
+    archive_id, final, _ = archive_layout(tarpath,target)
+    marker_path = final/'.extract_complete.json'
+    if final.is_symlink() or not final.is_dir() or not marker_path.is_file():
+        return None
+    try:
+        marker = json.loads(marker_path.read_text(encoding='utf-8'))
+        expected = {'archive':tarpath.name,'archive_bytes':tarpath.stat().st_size,
+                    'archive_mtime_ns':tarpath.stat().st_mtime_ns,
+                    'prefixes':list(prefixes),'layout':'per_archive'}
+        if any(marker.get(key) != value for key,value in expected.items()):
+            return None
+        files = [entry.name for entry in final.iterdir()
+                 if not entry.is_symlink() and entry.is_file() and entry.name.startswith(prefixes)]
+        if len(files) != marker['extracted_files']:
+            return None
+        return files
+    except (OSError,ValueError,KeyError,TypeError,json.JSONDecodeError):
+        return None
+
+
+def remove_incomplete(path):
+    if path.is_symlink():
+        raise ValueError(f'Refusing to remove extraction symlink: {path}')
+    if path.exists():
+        if not path.is_dir():
+            raise ValueError(f'Refusing to remove non-directory extraction path: {path}')
+        print(f'Removing incomplete extraction: {path}',flush=True)
+        shutil.rmtree(path)
+
+
+def register_archive(names, archive_id, files, tarpath):
+    for name in files:
+        if name in names:
+            raise ValueError(f'Duplicate selected image basename: {name} ({tarpath.name})')
+        names[name] = archive_id
+
+
+def extract(tarpath, target, prefixes, names=None, existing=None):
+    """Reuse a complete archive or atomically extract it into its batch directory."""
+    archive_id, final, part = archive_layout(tarpath,target)
     if names is None:
         names = {}
+    if existing is None:
+        existing = completed_archive_files(tarpath,target,prefixes)
+    if existing is not None:
+        register_archive(names,archive_id,existing,tarpath)
+        return names
+    remove_incomplete(part)
+    remove_incomplete(final)
+    target.mkdir(parents=True,exist_ok=True)
+    part.mkdir(parents=True)
+    current = set()
     with tarfile.open(tarpath, 'r|gz') as archive:
         for member in archive:
             name = Path(member.name).name
             if not member.isfile() or not name.startswith(prefixes):
                 continue
-            if name in names:
+            if name in names or name in current:
                 raise ValueError(f'Duplicate selected image basename: {name} ({tarpath.name})')
-            names[name] = archive_id
+            current.add(name)
             source = archive.extractfile(member)
-            with source, (target / name).open('wb') as out:
-                shutil.copyfileobj(source, out)
+            with source, (part / name).open('wb') as out:
+                shutil.copyfileobj(source,out)
+    marker = {'archive':tarpath.name,'archive_bytes':tarpath.stat().st_size,
+              'archive_mtime_ns':tarpath.stat().st_mtime_ns,'prefixes':list(prefixes),
+              'layout':'per_archive','extracted_files':len(current)}
+    (part/'.extract_complete.json').write_text(json.dumps(marker,indent=2),encoding='utf-8')
+    part.replace(final)
+    register_archive(names,archive_id,current,tarpath)
     return names
 
 
@@ -101,11 +162,14 @@ def prepare(data, archives, out, seed=42, max_length=40, min_ratio=1.0):
     if len(set(archives)) != len(archives):
         raise ValueError('Each image archive may be selected only once.')
     names = {}
-    with tqdm(archives, desc='Extracting archives', unit='archive') as progress:
+    with tqdm(archives, desc='Checking archives', unit='archive') as progress:
         for archive in progress:
-            progress.set_description(f'Extracting {archive.name}')
-            extract(archive, data / 'devanagari_ocr', PREFIXES, names)
-        progress.set_description('Archives extracted')
+            existing = completed_archive_files(archive,data/'devanagari_ocr',PREFIXES)
+            action = 'Reusing' if existing is not None else 'Extracting'
+            progress.set_description(f'{action} {archive.name}')
+            extract(archive,data/'devanagari_ocr',PREFIXES,names,existing)
+        progress.set_description('Archives ready')
+        progress.refresh()
     stats = Counter(extracted_hindi=len(names))
     samples, seen, digests = [], set(), set()
     for record in annotations(data / 'devanagari_ocr.json'):
