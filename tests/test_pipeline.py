@@ -103,7 +103,8 @@ class PipelineTest(unittest.TestCase):
             expected_train=(root/'out1/train.txt').read_bytes()
             completed=data/'devanagari_ocr/images_batch_001/hindi_local_0.png'
             original_mtime=completed.stat().st_mtime_ns
-            with mock.patch('prepare.shutil.rmtree',wraps=shutil.rmtree) as remove:
+            with mock.patch('prepare.shutil.rmtree',wraps=shutil.rmtree) as remove, \
+                    mock.patch.object(Path,'iterdir',side_effect=AssertionError('directory scan during manifest reuse')):
                 prepare(data,archives,root/'out2')
                 remove.assert_not_called()
             self.assertEqual(completed.stat().st_mtime_ns,original_mtime)
@@ -125,7 +126,17 @@ class PipelineTest(unittest.TestCase):
             self.assertFalse(part.exists())
             marker=json.loads((final/'.extract_complete.json').read_text())
             self.assertEqual(marker['extracted_files'],15)
+            manifest=final/'filenames.json'
+            files=json.loads(manifest.read_text())
+            self.assertEqual(len(files),15)
+            self.assertEqual(len(set(files)),15)
+            self.assertEqual(marker['manifest_sha256'],file_sha256(manifest))
             self.assertEqual((root/'out3/train.txt').read_bytes(),expected_train)
+            manifest.write_text('[]',encoding='utf-8')
+            with mock.patch('prepare.shutil.rmtree',wraps=shutil.rmtree) as remove:
+                prepare(data,archives,root/'out4')
+                self.assertIn(final,{call.args[0] for call in remove.call_args_list})
+            self.assertEqual((root/'out4/train.txt').read_bytes(),expected_train)
 
     def test_stream_array_and_jsonl(self):
         with tempfile.TemporaryDirectory() as t:

@@ -143,11 +143,14 @@ data/devanagari_ocr/images_batch_002/
 A `tqdm.auto` progress bar shows whether each archive is being reused or
 extracted, plus the completed archive count. Extraction is interruption-safe:
 each batch is first written to `images_batch_NNN.part/`, then marked complete and
-atomically renamed. Later runs validate the marker, archive metadata, and file
-count before reusing a batch. Incomplete batches are reported, removed, and
-re-extracted; completed batches are not modified. Existing directories without
-markers are conservatively re-extracted once. Skipped batches are scanned to
-rebuild the basename mapping, so global splits and subsets remain unchanged.
+atomically renamed. Each completed directory also contains `filenames.json`, a
+hash-verified manifest of every selected basename. Later runs validate the
+archive metadata and manifest, then rebuild the basename mapping directly from
+that sequential JSON read without scanning the image directory. Completed
+directories are treated as immutable; manually deleting or changing their files
+is outside the reuse guarantee. Incomplete or legacy directories without valid
+markers and manifests are reported, removed, and re-extracted. Global splits and
+subsets remain unchanged.
 
 Label paths include the same archive directory. Samples are sorted by basename
 before the existing seed-42 global shuffle, so
@@ -471,6 +474,13 @@ respective terms and credit the underlying source datasets for published work.
 This project's code is provided under Apache-2.0 (see LICENSE).
 
 ## Update log
+
+### 2026-11-19
+
+- Completed extraction directories now include a hash-verified `filenames.json`
+  manifest. Reuse rebuilds the basename mapping from this sequential read instead
+  of scanning every image directory entry; completed directories are treated as
+  immutable after extraction.
 
 ### 2026-11-18
 

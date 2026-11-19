@@ -75,9 +75,17 @@ def completed_archive_files(tarpath, target, prefixes):
                     'prefixes':list(prefixes),'layout':'per_archive'}
         if any(marker.get(key) != value for key,value in expected.items()):
             return None
-        files = [entry.name for entry in final.iterdir()
-                 if not entry.is_symlink() and entry.is_file() and entry.name.startswith(prefixes)]
-        if len(files) != marker['extracted_files']:
+        if marker.get('manifest') != 'filenames.json':
+            return None
+        manifest_bytes = (final/'filenames.json').read_bytes()
+        if hashlib.sha256(manifest_bytes).hexdigest() != marker['manifest_sha256']:
+            return None
+        files = json.loads(manifest_bytes)
+        if not isinstance(files,list) or len(files) != marker['extracted_files']:
+            return None
+        if any(not isinstance(name,str) or not name.startswith(prefixes) for name in files):
+            return None
+        if len(set(files)) != len(files):
             return None
         return files
     except (OSError,ValueError,KeyError,TypeError,json.JSONDecodeError):
@@ -127,12 +135,16 @@ def extract(tarpath, target, prefixes, names=None, existing=None):
             source = archive.extractfile(member)
             with source, (part / name).open('wb') as out:
                 shutil.copyfileobj(source,out)
+    files = sorted(current)
+    manifest_bytes = json.dumps(files,separators=(',',':')).encode('utf-8')
+    (part/'filenames.json').write_bytes(manifest_bytes)
     marker = {'archive':tarpath.name,'archive_bytes':tarpath.stat().st_size,
               'archive_mtime_ns':tarpath.stat().st_mtime_ns,'prefixes':list(prefixes),
-              'layout':'per_archive','extracted_files':len(current)}
+              'layout':'per_archive','extracted_files':len(files),
+              'manifest':'filenames.json','manifest_sha256':hashlib.sha256(manifest_bytes).hexdigest()}
     (part/'.extract_complete.json').write_text(json.dumps(marker,indent=2),encoding='utf-8')
     part.replace(final)
-    register_archive(names,archive_id,current,tarpath)
+    register_archive(names,archive_id,files,tarpath)
     return names
 
 
