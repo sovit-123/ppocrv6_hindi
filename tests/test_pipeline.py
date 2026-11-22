@@ -14,6 +14,7 @@ import yaml
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import prepare as prepare_module
 import run as run_module
+from check_data import check_data
 from prepare import prepare, annotations, ctc_steps
 from run import (checkpoint_config_for, config_for, download_weights, file_sha256, require_setup, subset_for,
                  ROOT, MODEL_SIZES, RESET_PREFIXES, pretrained_filename)
@@ -83,6 +84,48 @@ class PipelineTest(unittest.TestCase):
             report=json.loads((root/'out/report.json').read_text())
             self.assertEqual(report['layout'],'per_archive')
             self.assertEqual(report['stats']['orphan_images'],0)
+
+    def test_check_data_validates_replication_and_detects_corruption(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp); data=root/'data'; data.mkdir(); archives=[]; records=[]
+            for batch in (1,2):
+                tar=data/f'images_batch_{batch:03d}.tar.gz'; archives.append(tar)
+                with tarfile.open(tar,'w:gz') as f:
+                    for i in range((batch-1)*15,batch*15):
+                        name=f'hindi_local_{i}.png'
+                        im=Image.new('RGB',(80,20),(i,100,200))
+                        b=io.BytesIO(); im.save(b,format='PNG'); raw=b.getvalue()
+                        member=tarfile.TarInfo(name); member.size=len(raw)
+                        f.addfile(member,io.BytesIO(raw))
+                        records.append({'images':[name],
+                                        'messages':[{'role':'assistant','content':'हिन्दी पाठ'}]})
+            (data/'devanagari_ocr.json').write_text(json.dumps(records,ensure_ascii=False))
+            prepare(data,archives,root/'out')
+            provenance=[{'repo':prepare_module.REPO,'revision':'test-revision',
+                         'files':['devanagari_ocr.json',f'data/{tar.name}']} for tar in archives]
+            (root/'out/dataset_source.json').write_text(json.dumps(provenance))
+            result=check_data(data,archives,root/'out',deep=True)
+            self.assertEqual(result['status'],'passed',result['errors'])
+            prepare(data,archives,root/'short',max_length=20)
+            (root/'short/dataset_source.json').write_text(json.dumps(provenance))
+            result=check_data(data,archives,root/'short')
+            self.assertEqual(result['status'],'passed',result['errors'])
+            source_path=root/'out/dataset_source.json'
+            original_provenance=source_path.read_bytes()
+            missing_revision=[dict(entry,revision='') for entry in provenance]
+            source_path.write_text(json.dumps(missing_revision))
+            result=check_data(data,archives,root/'out')
+            self.assertIn('provenance_revision_missing',{error['code'] for error in result['errors']})
+            source_path.write_bytes(original_provenance)
+            corrupted=data/'devanagari_ocr/images_batch_001/hindi_local_0.png'
+            corrupted.write_bytes(b'corrupt')
+            result=check_data(data,archives,root/'out',deep=True)
+            self.assertEqual(result['status'],'failed')
+            self.assertIn('extracted_content_mismatch',{error['code'] for error in result['errors']})
+            corrupted.unlink()
+            result=check_data(data,archives,root/'out')
+            self.assertEqual(result['status'],'failed')
+            self.assertIn('missing_extracted_files',{error['code'] for error in result['errors']})
 
     def test_extraction_reuses_complete_and_replaces_interrupted_batches(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -198,6 +198,41 @@ That still trains on one shard when you use `--prepared prepared_batch2` below.
 Do not merge prepared directories. Re-running downloads uses Hugging Face's cache;
 interrupted extraction can be repeated with a fresh/nonexistent output folder.
 
+## 2.1 Verify downloaded, extracted, and prepared data
+
+After `python prepare.py --all-batches`, run:
+
+```bash
+python check_data.py
+```
+
+The default validator checks all 42 archives and their metadata/manifests,
+compares manifests with physical per-batch files, scans annotations for record
+counts and source-to-prepared transcription equality, and validates prepared
+label paths, text, split membership,
+`splits.csv`, per-prefix counts, vocabulary, OOV lists, hashes, and provenance.
+It writes a machine-readable report to `prepared/check_data_report.json` and
+returns exit status 0 on success or 1 on validation failure.
+
+For a complete byte-for-byte comparison of every selected tar member and its
+extracted image, run:
+
+```bash
+python check_data.py --deep
+```
+
+Deep validation is intentionally slow because it decompresses and reads all
+selected archive and extracted-file content. The default does not compare image
+bytes or re-run decoded-image deduplication. Full validation builds in-memory
+image and transcription indices, so allow several GB of RAM. Use `--data-dir`,
+`--prepared`, or
+`--report` for alternate locations and `--max-errors` to cap detailed errors.
+
+No tracked global data list is required. Expected inventory is derived from the
+42 archive names, `prepare.py` prefixes, and generated metadata. The validation
+report is an artifact under the gitignored prepared directory, not a baseline
+that needs to be committed.
+
 ## 3. Initialize the Hindi model and create training config
 
 Choose a model size with `--model-size tiny`, `small`, or `medium` (the default):
@@ -427,7 +462,8 @@ full detector + recognizer pipeline is a later step.
 
 | File | Purpose |
 |---|---|
-| `prepare.py` | One-shard download/extraction, streamed annotations, checks, dictionary and split |
+| `prepare.py` | Multi-archive download/extraction, resumable manifests, streamed annotations, dictionary and split |
+| `check_data.py` | Archive, extraction, annotation, label, split, manifest, and provenance validation |
 | `run.py` | Pinned checkout and weight setup, checkpoint adaptation, config generation, upstream tool commands |
 | `requirements.txt` | Small data/preparation dependencies; Paddle installed separately |
 | `requirements-training.txt` | CPU smoke-tested top-level training dependency versions |
@@ -474,6 +510,14 @@ respective terms and credit the underlying source datasets for published work.
 This project's code is provided under Apache-2.0 (see LICENSE).
 
 ## Update log
+
+### 2026-11-22
+
+- Added `check_data.py` for archive/manifest, physical extraction, annotation,
+  prepared-label, split, dictionary, hash, and provenance validation. Its optional
+  `--deep` mode compares every selected tar member byte-for-byte with the
+  extracted file. Reports go to `prepared/check_data_report.json`; no tracked
+  global data inventory is required.
 
 ### 2026-11-19
 
