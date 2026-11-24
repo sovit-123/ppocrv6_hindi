@@ -16,3 +16,4 @@ requests==2.34.2
 albumentations==2.0.8
 albucore==0.0.24
 packaging==26.3
+paddlex[ocr-core]==3.7.2

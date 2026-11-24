@@ -16,8 +16,9 @@ import prepare as prepare_module
 import run as run_module
 from check_data import check_data
 from prepare import prepare, annotations, ctc_steps
-from run import (checkpoint_config_for, config_for, download_weights, file_sha256, require_setup, subset_for,
-                 ROOT, MODEL_SIZES, RESET_PREFIXES, pretrained_filename)
+from run import (checkpoint_config_for, config_for, download_detector, download_weights, file_sha256,
+                 require_setup, run_page, subset_for, ROOT, MODEL_SIZES, RESET_PREFIXES,
+                 DET_MODEL_NAME, pretrained_filename)
 
 class PipelineTest(unittest.TestCase):
     def test_single_shard_schema_filter_split_and_dedup(self):
@@ -409,5 +410,56 @@ class PipelineTest(unittest.TestCase):
             self.assertIn('--checkpoint',command)
             self.assertIn(str(checkpoint),command)
             self.assertIn(str(staged),command)
+
+    def test_detector_download_extracts_and_reuses_bundle(self):
+        with tempfile.TemporaryDirectory() as t:
+            root=Path(t); inference=root/'inference'; inference.mkdir()
+            archive=root/'detector.tar'
+            with tarfile.open(archive,'w') as tar:
+                for name in ('inference.yml','inference.json','inference.pdiparams'):
+                    raw=b'model'
+                    member=tarfile.TarInfo('bundle/'+name); member.size=len(raw)
+                    tar.addfile(member,io.BytesIO(raw))
+            with mock.patch('run.urllib.request.urlretrieve',
+                            side_effect=lambda _url,path: shutil.copyfile(archive,path)) as fetch:
+                final=download_detector(inference)
+                self.assertEqual(final.name,DET_MODEL_NAME)
+                for name in ('inference.yml','inference.json','inference.pdiparams'):
+                    self.assertTrue((final/name).is_file())
+                self.assertEqual(download_detector(inference),final)
+                self.assertEqual(fetch.call_count,1)
+
+    def test_page_uses_medium_detector_and_custom_recognizer(self):
+        with tempfile.TemporaryDirectory() as t:
+            root=Path(t); upstream=root/'upstream'; upstream.mkdir(); rec=root/'rec'; rec.mkdir()
+            (rec/'inference.yml').write_text('Global:\n  model_name: PP-OCRv6_tiny_rec\n')
+            (rec/'inference.json').write_text('{}')
+            (rec/'inference.pdiparams').write_bytes(b'model')
+            image=root/'page.png'; image.write_bytes(b'image')
+            output=root/'output'; detector=root/'detector'
+            class Result:
+                def __init__(self,text): self.text=text
+                def __getitem__(self,key):
+                    return {'rec_texts':[self.text],'rec_scores':[0.75]}[key]
+                def save_to_img(self,path): (Path(path)/'annotated.png').write_bytes(b'image')
+                def save_to_json(self,path): (Path(path)/'result.json').write_text('{}')
+            class FakeOCR:
+                kwargs=None
+                closed=False
+                def __init__(self,**kwargs): FakeOCR.kwargs=kwargs
+                def predict_iter(self,_image): return iter([Result('पहला'),Result('दूसरा')])
+                def close(self): FakeOCR.closed=True
+            with mock.patch.dict(sys.modules,{'paddleocr':mock.MagicMock(PaddleOCR=FakeOCR)}), \
+                    mock.patch('run.validate_upstream'), mock.patch('run.download_detector',return_value=detector):
+                run_page(upstream,rec,image,output,'cpu')
+            self.assertEqual(FakeOCR.kwargs['text_detection_model_name'],DET_MODEL_NAME)
+            self.assertEqual(FakeOCR.kwargs['text_detection_model_dir'],str(detector))
+            self.assertEqual(FakeOCR.kwargs['text_recognition_model_name'],'PP-OCRv6_tiny_rec')
+            self.assertEqual(FakeOCR.kwargs['text_recognition_model_dir'],str(rec))
+            self.assertNotIn('lang',FakeOCR.kwargs)
+            self.assertTrue(FakeOCR.closed)
+            for page in (1,2):
+                self.assertTrue((output/f'page_{page:03d}/annotated.png').is_file())
+                self.assertTrue((output/f'page_{page:03d}/result.json').is_file())
 
 if __name__=='__main__': unittest.main()

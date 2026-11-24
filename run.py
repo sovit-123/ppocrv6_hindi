@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tarfile
 import urllib.request
 import yaml
 
@@ -17,6 +18,10 @@ DEFAULT_UPSTREAM = ROOT/'third_party/PaddleOCR'
 WEIGHTS = ROOT/'weights'
 MODEL_SIZES = ('tiny','small','medium')
 PRETRAINED_FILENAME = 'PP-OCRv6_medium_rec_pretrained.pdparams'
+INFERENCE = ROOT/'inference'
+DET_MODEL_NAME = 'PP-OCRv6_medium_det'
+DET_INFER_URL = ('https://paddle-model-ecology.bj.bcebos.com/paddlex/official_inference_model/'
+                 'paddle3.0.0/PP-OCRv6_medium_det_infer.tar')
 RESET_PREFIXES = ('head.ctc_head.fc.', 'head.ctc_head.fc2.',
                   'head.gtc_head.embedding.', 'head.gtc_head.tgt_word_prj.')
 
@@ -63,6 +68,62 @@ def download_weights(weights, model_size='medium'):
     return original
 
 
+def inference_bundle_valid(path):
+    return (path.is_dir() and (path/'inference.pdiparams').is_file()
+            and (path/'inference.yml').is_file()
+            and ((path/'inference.json').is_file() or (path/'inference.pdmodel').is_file()))
+
+
+def download_detector(inference=INFERENCE):
+    """Download and atomically extract the official medium detector bundle."""
+    final = inference/DET_MODEL_NAME
+    if inference_bundle_valid(final):
+        return final
+    inference.mkdir(parents=True,exist_ok=True)
+    archive = inference/f'{DET_MODEL_NAME}_infer.tar'
+    if not archive.exists():
+        temp = archive.with_suffix('.part')
+        print('Downloading official medium detection model...',flush=True)
+        urllib.request.urlretrieve(DET_INFER_URL,temp)
+        temp.replace(archive)
+    part = inference/f'{DET_MODEL_NAME}.part'
+    if part.is_symlink():
+        part.unlink()
+    elif part.is_dir():
+        shutil.rmtree(part)
+    elif part.exists():
+        part.unlink()
+    if final.is_symlink():
+        final.unlink()
+    elif final.is_dir():
+        shutil.rmtree(final)
+    elif final.exists():
+        final.unlink()
+    part.mkdir()
+    with tarfile.open(archive,'r') as tar:
+        for member in tar:
+            member_path = Path(member.name)
+            if (member_path.is_absolute() or '..' in member_path.parts
+                    or member.issym() or member.islnk()):
+                raise ValueError(f'Unsafe detector archive member: {member.name}')
+        tar.extractall(part,filter='data')
+    if not inference_bundle_valid(part):
+        candidates = list(part.rglob('inference.yml'))
+        if len(candidates) != 1:
+            raise ValueError(f'Could not locate detector inference.yml in {archive}')
+        bundle_root = candidates[0].parent
+    else:
+        bundle_root = part
+    if bundle_root == part:
+        part.replace(final)
+    else:
+        shutil.move(str(bundle_root),str(final))
+        shutil.rmtree(part)
+    if not inference_bundle_valid(final):
+        raise ValueError(f'Incomplete detector inference bundle: {final}')
+    return final
+
+
 def require_setup(upstream=DEFAULT_UPSTREAM, weights=WEIGHTS, model_size=None):
     """Validate setup prerequisites without downloading or modifying anything."""
     validate_upstream(upstream)
@@ -80,7 +141,9 @@ def setup(upstream, weights=WEIGHTS, model_size='medium'):
         shell(['git','checkout',PADDLE_REF], upstream)
     validate_upstream(upstream)
     original = download_weights(weights,model_size)
+    detector = download_detector()
     print(f'Pinned upstream and official {model_size} weights ready: {original}')
+    print(f'Official medium detector ready: {detector}')
     print('Install the training dependencies as described in README.')
     return original
 
@@ -249,9 +312,61 @@ def verify_subset(subset):
     return subset
 
 
+def recognizer_model_name(rec_model_dir):
+    if not inference_bundle_valid(rec_model_dir):
+        raise ValueError(f'Incomplete recognizer inference bundle: {rec_model_dir}')
+    config = yaml.safe_load((rec_model_dir/'inference.yml').read_text(encoding='utf-8'))
+    name = config.get('Global',{}).get('model_name')
+    if name not in {f'PP-OCRv6_{size}_rec' for size in MODEL_SIZES}:
+        raise ValueError(f'Unsupported custom recognition model: {name!r}')
+    return name
+
+
+def run_page(upstream, rec_model_dir, image, output, device):
+    """Run full-page OCR with the fixed medium detector and a custom recognizer."""
+    image = image.resolve()
+    if not image.is_file():
+        raise ValueError(f'Input image/document does not exist: {image}')
+    rec_model_dir = rec_model_dir.resolve()
+    rec_name = recognizer_model_name(rec_model_dir)
+    validate_upstream(upstream)
+    sys.path.insert(0,str(upstream))
+    try:
+        from paddleocr import PaddleOCR
+    except ImportError as exc:
+        raise RuntimeError('Full-page OCR requires paddlex[ocr-core]==3.7.2. '
+                           'Install requirements-training.txt first.') from exc
+    detector_dir = download_detector()
+    ocr = PaddleOCR(
+        text_detection_model_name=DET_MODEL_NAME,
+        text_detection_model_dir=str(detector_dir),
+        text_recognition_model_name=rec_name,
+        text_recognition_model_dir=str(rec_model_dir),
+        use_doc_orientation_classify=False,
+        use_doc_unwarping=False,
+        use_textline_orientation=False,
+        device=device,
+    )
+    page_count = 0
+    try:
+        for page_count, result in enumerate(ocr.predict_iter(str(image)),start=1):
+            destination = output/f'page_{page_count:03d}'
+            destination.mkdir(parents=True,exist_ok=True)
+            result.save_to_img(str(destination))
+            result.save_to_json(str(destination))
+            texts = list(result['rec_texts'])
+            scores = list(result['rec_scores'])
+            print(f'Page {page_count}: {len(texts)} text regions; saved to {destination}')
+            for text,score in zip(texts,scores):
+                print(f'  {text}\t{float(score):.4f}')
+    finally:
+        ocr.close()
+    print(f'Processed {page_count} page(s) from {image}')
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('action',choices=['setup','configure','train','eval','test','export','infer'])
+    p.add_argument('action',choices=['setup','configure','train','eval','test','export','infer','page'])
     p.add_argument('--upstream',type=Path,default=DEFAULT_UPSTREAM)
     p.add_argument('--model-size',choices=MODEL_SIZES,default='medium',
                    help='Model variant to download during setup or configure')
@@ -272,12 +387,15 @@ def main():
     p.add_argument('--checkpoint',type=Path,help='Trained checkpoint prefix or .pdparams file')
     p.add_argument('--resume',type=Path,help='Training checkpoint prefix with .pdopt and .states siblings')
     p.add_argument('--image',type=Path)
+    p.add_argument('--rec-model-dir',type=Path,
+                   help='Exported custom recognizer directory for full-page OCR')
     p.add_argument('--model',choices=['finetuned','official'],default='finetuned',
                    help='infer weights: fine-tuned Hindi checkpoint or official pretrained')
     a = p.parse_args()
     for key in ('upstream','data_dir','prepared'):
         setattr(a,key,getattr(a,key).resolve())
-    a.output = (a.output or ROOT/'output'/f'hindi_rec_{a.model_size}').resolve()
+    default_output = ROOT/'output/page_ocr' if a.action=='page' else ROOT/'output'/f'hindi_rec_{a.model_size}'
+    a.output = (a.output or default_output).resolve()
     if min(a.batch_size,a.epochs,a.eval_every)<=0 or a.workers<0 or a.lr<=0:
         p.error('Invalid training arguments')
     for value in (a.num_samples,a.num_eval_samples):
@@ -293,6 +411,13 @@ def main():
         p.error('Resume uses the saved effective configuration; do not change sample counts')
     if a.action=='setup':
         setup(a.upstream,model_size=a.model_size); return
+    if a.action=='page':
+        if not a.rec_model_dir:
+            p.error('--rec-model-dir is required with page')
+        if not a.image:
+            p.error('--image is required with page')
+        run_page(a.upstream,a.rec_model_dir,a.image,a.output,a.device)
+        return
     config_path = a.output/'train_config.yml'
     if a.action=='configure':
         setup(a.upstream,model_size=a.model_size)
