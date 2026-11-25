@@ -457,14 +457,15 @@ python gradio_app.py --inference-dir /path/to/inference
 
 `PPOCRV6_INFER_DIR=/path/to/inference` is also supported. The exported directory
 must be writable because upstream creates `ppocr_keys.txt` on first load.
-This project uses upstream crop inference; integrating custom weights into a
-full detector + recognizer pipeline is a later step.
+This project also supports full detector + recognizer inference through the
+high-level PaddleOCR API, described below.
 
-## 6. Full-page OCR with the official medium detector
+## 6. Detector-based and cropped inference
 
-Full-page OCR always uses the official `PP-OCRv6_medium_det` detector and a
-custom recognizer supplied by its **exported inference directory**. There is no
-language dropdown or `lang` setting. Install the full-page runtime dependency
+The default high-level inference path uses the official `PP-OCRv6_medium_det`
+detector with a custom recognizer supplied by its **exported inference
+directory**. Use the same command for crops and full pages; there is no language
+dropdown or `lang` setting. Install the full-page runtime dependency
 (`paddlex[ocr-core]==3.7.2` is included in `requirements-training.txt`):
 
 ```bash
@@ -473,10 +474,10 @@ python run.py setup --model-size tiny
 ```
 
 The setup command downloads both the selected recognition training checkpoint
-and the fixed medium detector. Run full-page OCR:
+and the fixed medium detector. Run detector+recognizer inference:
 
 ```bash
-python run.py page \
+python run.py infer \
   --image /absolute/path/to/page.png \
   --rec-model-dir output/hindi_rec_tiny/inference \
   --output output/page_ocr \
@@ -485,10 +486,28 @@ python run.py page \
 
 The recognizer architecture name is read from `inference.yml`; tiny, small, and
 medium custom recognizers can all use the fixed medium detector. A raw training
-`.pdparams` is not accepted here—export it first with `run.py export`.
+`.pdparams` is not accepted for this exported-model route—export it first with
+`run.py export`. `run.py page` remains available as an alias for the same
+detector-based behavior.
 
-Each result is saved as an annotated image and JSON under natural page-numbered
-directories:
+If the input is already a crop and you want to bypass the detector, use
+`--cropped`:
+
+```bash
+python run.py infer \
+  --image /absolute/path/to/tight_crop.png \
+  --rec-model-dir output/hindi_rec_tiny/inference \
+  --cropped \
+  --device gpu
+```
+
+Cropped predictions are written to `predictions.txt` as
+`<image-path><TAB>text<TAB>confidence`. The existing dynamic
+`infer --checkpoint` route also remains direct cropped recognition and does not
+require the flag.
+
+Detector-based results are saved as annotated images and JSON under natural
+page-numbered directories:
 
 ```text
 output/page_ocr/
@@ -498,8 +517,21 @@ output/page_ocr/
 ```
 
 The CLI prints recognized text and confidence per region. Document orientation,
-unwarping, and text-line orientation models are disabled. Gradio full-page
-integration is intentionally a separate later change.
+unwarping, and text-line orientation models are disabled.
+
+### Gradio
+
+Run the UI with an exported recognizer:
+
+```bash
+python gradio_app.py --inference-dir output/hindi_rec_tiny/inference
+```
+
+The official medium detector runs by default. Select **Input is already cropped
+(--cropped)** in the UI to bypass it. Full-page results include per-region rows,
+an annotated-page gallery, and structured JSON. The `checkpoint` and `official`
+routes remain crop-only; their cropped checkbox is selected and disabled
+automatically.
 
 ## Project files
 
@@ -553,6 +585,14 @@ respective terms and credit the underlying source datasets for published work.
 This project's code is provided under Apache-2.0 (see LICENSE).
 
 ## Update log
+
+### 2026-11-25
+
+- Unified CLI and Gradio inference: the medium detector now runs by default for
+  `infer --rec-model-dir`, while `--cropped` explicitly bypasses detection.
+  `page` remains an alias. Gradio adds per-region results, annotated-page
+  gallery, and structured JSON; dynamic checkpoint and official routes remain
+  crop-only.
 
 ### 2026-11-24
 

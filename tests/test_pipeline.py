@@ -17,7 +17,7 @@ import run as run_module
 from check_data import check_data
 from prepare import prepare, annotations, ctc_steps
 from run import (checkpoint_config_for, config_for, download_detector, download_weights, file_sha256,
-                 require_setup, run_page, subset_for, ROOT, MODEL_SIZES, RESET_PREFIXES,
+                 require_setup, run_cropped, run_page, subset_for, ROOT, MODEL_SIZES, RESET_PREFIXES,
                  DET_MODEL_NAME, pretrained_filename)
 
 class PipelineTest(unittest.TestCase):
@@ -391,8 +391,8 @@ class PipelineTest(unittest.TestCase):
             self.assertIn(f'Global.infer_img={image}',command)
 
     def test_gradio_checkpoint_route_uses_portable_bundle(self):
-        with tempfile.TemporaryDirectory() as t, mock.patch.dict(sys.modules,{'gradio':mock.MagicMock()}):
-            app=importlib.import_module('gradio_app')
+        with tempfile.TemporaryDirectory() as t, mock.patch.dict(sys.modules,{'gradio':mock.MagicMock(),'cv2':mock.MagicMock()}):
+            app=sys.modules.get('gradio_app') or importlib.import_module('gradio_app')
             root=Path(t); bundle=root/'shared'; bundle.mkdir(); upstream=root/'upstream'; upstream.mkdir()
             checkpoint=bundle/'best_accuracy.pdparams'; checkpoint.write_bytes(b'checkpoint')
             with mock.patch.object(sys,'argv',['gradio_app.py','--checkpoint',str(checkpoint)]):
@@ -461,5 +461,57 @@ class PipelineTest(unittest.TestCase):
             for page in (1,2):
                 self.assertTrue((output/f'page_{page:03d}/annotated.png').is_file())
                 self.assertTrue((output/f'page_{page:03d}/result.json').is_file())
+
+    def test_infer_cli_cropped_flag_selects_direct_route(self):
+        with tempfile.TemporaryDirectory() as t:
+            root=Path(t); rec=root/'rec'; image=root/'crop.png'; image.write_bytes(b'image')
+            argv=['run.py','infer','--rec-model-dir',str(rec),'--image',str(image),'--cropped']
+            with mock.patch.object(sys,'argv',argv), mock.patch('run.run_cropped') as cropped, \
+                    mock.patch('run.run_page') as page:
+                run_module.main()
+                cropped.assert_called_once()
+                page.assert_not_called()
+
+    def test_cropped_inference_bypasses_detector(self):
+        with tempfile.TemporaryDirectory() as t:
+            root=Path(t); upstream=root/'upstream'; upstream.mkdir(); rec=root/'rec'; rec.mkdir()
+            (rec/'inference.yml').write_text('Global:\n  model_name: PP-OCRv6_tiny_rec\n')
+            (rec/'inference.json').write_text('{}')
+            (rec/'inference.pdiparams').write_bytes(b'model')
+            image=root/'crop.png'; image.write_bytes(b'image')
+            class FakeRecognition:
+                kwargs=None
+                closed=False
+                def __init__(self,**kwargs): FakeRecognition.kwargs=kwargs
+                def predict(self,_image): return [{'rec_text':'हिन्दी','rec_score':0.8}]
+                def close(self): FakeRecognition.closed=True
+            with mock.patch.dict(sys.modules,{'paddleocr':mock.MagicMock(TextRecognition=FakeRecognition)}), \
+                    mock.patch('run.validate_upstream'), mock.patch('run.ROOT',root):
+                run_cropped(upstream,rec,image,'cpu')
+            self.assertEqual(FakeRecognition.kwargs['model_name'],'PP-OCRv6_tiny_rec')
+            self.assertEqual(FakeRecognition.kwargs['model_dir'],str(rec))
+            self.assertTrue(FakeRecognition.closed)
+            self.assertEqual((root/'predictions.txt').read_text(),f'{image}\tहिन्दी\t0.8\n')
+
+    def test_gradio_full_page_returns_regions_and_artifacts(self):
+        with tempfile.TemporaryDirectory() as t, mock.patch.dict(sys.modules,{'gradio':mock.MagicMock(),'cv2':mock.MagicMock()}):
+            app=sys.modules.get('gradio_app') or importlib.import_module('gradio_app')
+            root=Path(t); app.ROOT=root
+            source=root/'page.png'; source.write_bytes(b'image')
+            class Result:
+                def __init__(self): self.json={'rec_texts':['हिन्दी'],'rec_scores':[0.75]}
+                def __getitem__(self,key): return self.json[key]
+                def save_to_img(self,path): (Path(path)/'annotated.png').write_bytes(b'image')
+                def save_to_json(self,path): (Path(path)/'result.json').write_text('{}')
+            class FakeOCR:
+                def predict_iter(self,_image): return iter([Result()])
+            with mock.patch.object(app,'load_page_ocr',return_value=FakeOCR()):
+                rows,log,images,data=app.infer_page(source,source,'cpu')
+            self.assertEqual(rows[0][0],'page.png')
+            self.assertEqual(rows[0][1],'page 1, region 1')
+            self.assertEqual(rows[0][2],'हिन्दी')
+            self.assertEqual(rows[0][4],'ok')
+            self.assertEqual(data[0]['rec_texts'],['हिन्दी'])
+            self.assertTrue(Path(images[0]).is_file())
 
 if __name__=='__main__': unittest.main()

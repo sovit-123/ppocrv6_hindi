@@ -364,6 +364,33 @@ def run_page(upstream, rec_model_dir, image, output, device):
     print(f'Processed {page_count} page(s) from {image}')
 
 
+def run_cropped(upstream, rec_model_dir, image, device):
+    """Recognize one already-cropped image without running the detector."""
+    image = image.resolve()
+    if not image.is_file():
+        raise ValueError(f'Input crop does not exist: {image}')
+    rec_model_dir = rec_model_dir.resolve()
+    rec_name = recognizer_model_name(rec_model_dir)
+    validate_upstream(upstream)
+    sys.path.insert(0,str(upstream))
+    try:
+        from paddleocr import TextRecognition
+    except ImportError as exc:
+        raise RuntimeError('Full-page OCR requires paddlex[ocr-core]==3.7.2. '
+                           'Install requirements-training.txt first.') from exc
+    recognizer = TextRecognition(model_name=rec_name,model_dir=str(rec_model_dir),device=device)
+    try:
+        results = recognizer.predict(str(image))
+        with (ROOT/'predictions.txt').open('w',encoding='utf-8') as output:
+            for result in results:
+                text = result['rec_text']
+                score = float(result['rec_score'])
+                output.write(f'{image}\t{text}\t{score}\n')
+                print(f'{image}\t{text}\t{score:.4f}')
+    finally:
+        recognizer.close()
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('action',choices=['setup','configure','train','eval','test','export','infer','page'])
@@ -389,12 +416,15 @@ def main():
     p.add_argument('--image',type=Path)
     p.add_argument('--rec-model-dir',type=Path,
                    help='Exported custom recognizer directory for full-page OCR')
+    p.add_argument('--cropped',action='store_true',
+                   help='Input is already a crop; bypass the detector (infer only)')
     p.add_argument('--model',choices=['finetuned','official'],default='finetuned',
                    help='infer weights: fine-tuned Hindi checkpoint or official pretrained')
     a = p.parse_args()
     for key in ('upstream','data_dir','prepared'):
         setattr(a,key,getattr(a,key).resolve())
-    default_output = ROOT/'output/page_ocr' if a.action=='page' else ROOT/'output'/f'hindi_rec_{a.model_size}'
+    use_page_output = a.action=='page' or (a.action=='infer' and a.rec_model_dir is not None)
+    default_output = ROOT/'output/page_ocr' if use_page_output else ROOT/'output'/f'hindi_rec_{a.model_size}'
     a.output = (a.output or default_output).resolve()
     if min(a.batch_size,a.epochs,a.eval_every)<=0 or a.workers<0 or a.lr<=0:
         p.error('Invalid training arguments')
@@ -409,6 +439,10 @@ def main():
         p.error('--num-samples and --num-eval-samples are only valid with train')
     if a.resume and (a.num_samples is not None or a.num_eval_samples is not None):
         p.error('Resume uses the saved effective configuration; do not change sample counts')
+    if a.cropped and a.action!='infer':
+        p.error('--cropped is only valid with infer')
+    if a.rec_model_dir and a.action not in ('infer','page'):
+        p.error('--rec-model-dir is only valid with infer and page')
     if a.action=='setup':
         setup(a.upstream,model_size=a.model_size); return
     if a.action=='page':
@@ -417,6 +451,14 @@ def main():
         if not a.image:
             p.error('--image is required with page')
         run_page(a.upstream,a.rec_model_dir,a.image,a.output,a.device)
+        return
+    if a.action=='infer' and a.rec_model_dir:
+        if not a.image:
+            p.error('--image is required with infer')
+        if a.cropped:
+            run_cropped(a.upstream,a.rec_model_dir,a.image,a.device)
+        else:
+            run_page(a.upstream,a.rec_model_dir,a.image,a.output,a.device)
         return
     config_path = a.output/'train_config.yml'
     if a.action=='configure':

@@ -1,20 +1,18 @@
 """Gradio UI for testing PP-OCRv6 Hindi recognition checkpoints.
 
-Upload one or more Hindi word/line crops and press "Run inference". Routes:
+Upload crops or full pages. The official medium detector runs by default with
+the custom recognizer; the cropped checkbox bypasses it. Routes:
 
+- `finetuned` uses the exported inference bundle from --inference-dir and
+  supports detector-based full-page OCR and direct cropped recognition. The
+  pipeline is cached per recognizer directory and device.
 - `checkpoint` runs a portable fine-tuned training checkpoint through
-  `python run.py infer --checkpoint`, separately per image. No export or
-  original prepared dataset is required. Supply the checkpoint with
-  `python gradio_app.py --checkpoint /path/to/best_accuracy.pdparams`.
-- `finetuned` runs the exported inference model in-process and caches it per
-  device. Use `python gradio_app.py --inference-dir /path/to/inference`, or the
-  default `output/hindi_rec_medium/inference/`. `PPOCRV6_INFER_DIR` remains
-  supported. The dictionary is embedded in `inference.yml`.
-- `official` shells out to `run.py infer --model official` for the stock
-  Chinese/English medium checkpoint, which cannot read Devanagari.
+  `run.py infer --checkpoint`, separately per image. It is crop-only.
+- `official` runs the stock Chinese/English medium recognizer for cropped
+  comparison and is also crop-only.
 
-Both dynamic routes rewrite `predictions.txt`; this app parses the final row.
-Only the exported route imports Paddle in this process. Nothing is trained.
+Dynamic crop routes rewrite `predictions.txt`. Detector-based results include
+per-region rows, annotated images, and structured JSON. Nothing is trained.
 
 Run with the same Python environment used for run.py, plus gradio
 (`python -m pip install gradio`; opencv-python is in requirements-training.txt).
@@ -27,11 +25,14 @@ import subprocess
 import sys
 import tempfile
 import traceback
+import uuid
 from pathlib import Path
 
 import cv2
 import gradio as gr
 from PIL import Image
+
+from run import DET_MODEL_NAME, download_detector, recognizer_model_name
 
 ROOT = Path(__file__).resolve().parent
 RUN_PY = ROOT / 'run.py'
@@ -41,6 +42,8 @@ INFER_DIR = Path(os.environ.get('PPOCRV6_INFER_DIR', ROOT / 'output' / 'hindi_re
 CHECKPOINT = None
 COMMAND_TIMEOUT = 600  # seconds per dynamic-route image, model load included
 _RECOGNIZERS = {}  # device -> TextRecognizer built from the exported bundle
+_PAGE_OCR = None
+_PAGE_KEY = None
 
 
 def stage_png(source, work, index):
@@ -145,19 +148,80 @@ def load_recognizer(device):
     return _RECOGNIZERS[device]
 
 
+def load_page_ocr(device):
+    """Load and cache the medium-detector plus custom-recognizer pipeline."""
+    global _PAGE_OCR, _PAGE_KEY
+    problem = exported_bundle_problem()
+    if problem:
+        raise gr.Error(problem)
+    rec_dir = INFER_DIR.resolve()
+    key = (str(rec_dir), device)
+    if _PAGE_OCR is None or _PAGE_KEY != key:
+        if _PAGE_OCR is not None:
+            _PAGE_OCR.close()
+            _PAGE_OCR = None
+            _PAGE_KEY = None
+        rec_name = recognizer_model_name(rec_dir)
+        detector_dir = download_detector()
+        if str(PADDLE_ROOT) not in sys.path:
+            sys.path.insert(0, str(PADDLE_ROOT))
+        from paddleocr import PaddleOCR
+        _PAGE_OCR = PaddleOCR(
+            text_detection_model_name=DET_MODEL_NAME,
+            text_detection_model_dir=str(detector_dir),
+            text_recognition_model_name=rec_name,
+            text_recognition_model_dir=str(rec_dir),
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False,
+            device=device,
+        )
+        _PAGE_KEY = key
+    return _PAGE_OCR
+
+
+def infer_page(source, staged, device):
+    """Run full-page detection and recognition, returning regions and artifacts."""
+    rows = []
+    images = []
+    page_data = []
+    log = [f'+ [medium detector + custom recognizer] {staged.name} (device={device})']
+    try:
+        ocr = load_page_ocr(device)
+        destination_root = ROOT / 'output' / 'gradio_ocr' / uuid.uuid4().hex
+        for page_number, result in enumerate(ocr.predict_iter(str(staged)), start=1):
+            destination = destination_root / f'page_{page_number:03d}'
+            destination.mkdir(parents=True, exist_ok=True)
+            result.save_to_img(str(destination))
+            result.save_to_json(str(destination))
+            texts = list(result['rec_texts'])
+            scores = list(result['rec_scores'])
+            for region_number, (text, score) in enumerate(zip(texts, scores), start=1):
+                rows.append([source.name, f'page {page_number}, region {region_number}',
+                             text, f'{float(score):.4f}', 'ok'])
+            images.extend(str(path) for path in sorted(destination.rglob('*.png')))
+            images.extend(str(path) for path in sorted(destination.rglob('*.jpg')))
+            page_data.append(result.json)
+            log.append(f'Page {page_number}: {len(texts)} regions; saved to {destination}')
+    except Exception as exc:
+        log.append(traceback.format_exc())
+        rows.append([source.name, '', '', '', f'predictor error: {exc}'])
+    return rows, log, images, page_data
+
+
 def infer_finetuned(source, staged, device):
     """Run one staged image through the exported inference model in-process."""
     log = [f'+ [exported inference model] {INFER_DIR} (device={device}) :: {staged.name}']
     img = cv2.imread(str(staged))
     if img is None:
-        return [source.name, '', '', f'not a readable image: cv2.imread({staged.name}) failed'], log
+        return [source.name, 'whole image', '', '', f'not a readable image: cv2.imread({staged.name}) failed'], log
     try:
         rec_res, _ = load_recognizer(device)([img])
         text, score = rec_res[0]
     except Exception as exc:
         log.append(traceback.format_exc())
-        return [source.name, '', '', f'predictor error: {exc}'], log
-    return [source.name, text, f'{score:.4f}', 'ok'], log
+        return [source.name, 'whole image', '', '', f'predictor error: {exc}'], log
+    return [source.name, 'whole image', text, f'{score:.4f}', 'ok'], log
 
 
 def infer_subprocess(source, command):
@@ -168,18 +232,18 @@ def infer_subprocess(source, command):
                               errors='replace', timeout=COMMAND_TIMEOUT)
     except subprocess.TimeoutExpired:
         log.append(f'[run.py timed out after {COMMAND_TIMEOUT}s]')
-        return [source.name, '', '', f'timeout after {COMMAND_TIMEOUT}s'], log
+        return [source.name, 'whole image', '', '', f'timeout after {COMMAND_TIMEOUT}s'], log
     for stream in ('stdout', 'stderr'):
         text = (getattr(done, stream) or '').strip()
         if text:
             log.append(text)
     if done.returncode != 0:
-        return [source.name, '', '', f'run.py exited with code {done.returncode}'], log
+        return [source.name, 'whole image', '', '', f'run.py exited with code {done.returncode}'], log
     try:
         text, score = read_last_prediction()
     except Exception as exc:
-        return [source.name, '', '', f'no prediction parsed: {exc}'], log
-    return [source.name, text, score, 'ok'], log
+        return [source.name, 'whole image', '', '', f'no prediction parsed: {exc}'], log
+    return [source.name, 'whole image', text, score, 'ok'], log
 
 
 def infer_official(source, staged, device):
@@ -196,38 +260,54 @@ def infer_checkpoint(source, staged, device):
     return infer_subprocess(source, command)
 
 
-def infer_uploads(files, model, device):
-    """Predict every uploaded image, streaming results out row by row."""
+def infer_uploads(files, model, device, cropped):
+    """Run detection by default, or direct recognition when input is cropped."""
     sources = [Path(f) for f in (files or [])]
     if not sources:
-        raise gr.Error('Upload at least one Hindi crop image first.')
+        raise gr.Error('Upload at least one Hindi crop or page image first.')
     model = model or ('checkpoint' if CHECKPOINT is not None else 'finetuned')
     device = device or 'gpu'
+    cropped = bool(cropped) or model != 'finetuned'
     if model == 'finetuned':
-        load_recognizer(device)  # fail fast on a missing bundle before staging
+        if cropped:
+            load_recognizer(device)
+        else:
+            load_page_ocr(device)
     elif model == 'checkpoint':
         problem = checkpoint_bundle_problem()
         if problem:
             raise gr.Error(problem)
-    rows, log = [], []
+    rows, log, images, page_data = [], [], [], []
     with tempfile.TemporaryDirectory(prefix='ppocrv6_gradio_') as tmp:
         work = Path(tmp)
         for index, source in enumerate(sources, start=1):
             try:
                 staged = stage_png(source, work, index)
             except Exception as exc:
-                rows.append([source.name, '', '', f'not a readable image: {exc}'])
+                rows.append([source.name, 'whole image', '', '', f'not a readable image: {exc}'])
                 log.append(f'# {source.name}: not a readable image ({exc})')
             else:
-                if model == 'finetuned':
-                    row, lines = infer_finetuned(source, staged, device)
-                elif model == 'checkpoint':
-                    row, lines = infer_checkpoint(source, staged, device)
+                if model == 'finetuned' and not cropped:
+                    page_rows, lines, page_images, page_json = infer_page(source, staged, device)
+                    rows.extend(page_rows)
+                    images.extend(page_images)
+                    page_data.extend(page_json)
                 else:
-                    row, lines = infer_official(source, staged, device)
-                rows.append(row)
+                    if model == 'finetuned':
+                        row, lines = infer_finetuned(source, staged, device)
+                    elif model == 'checkpoint':
+                        row, lines = infer_checkpoint(source, staged, device)
+                    else:
+                        row, lines = infer_official(source, staged, device)
+                    rows.append(row)
                 log.extend(lines)
-            yield rows, '\n'.join(log)
+            yield rows, '\n'.join(log), images, page_data
+
+
+def crop_mode_for_model(model):
+    """Only exported fine-tuned models support detector-based full-page OCR."""
+    return gr.Checkbox(value=model != 'finetuned', interactive=model == 'finetuned',
+                       label='Input is already cropped (--cropped)')
 
 
 def build_app():
@@ -239,23 +319,19 @@ def build_app():
     with gr.Blocks(title='PP-OCRv6 Hindi recognizer') as demo:
         gr.Markdown(
             '# PP-OCRv6 Hindi recognition\n'
-            'Upload Hindi word or short-line crops. Model routes:\n\n'
-            '- **checkpoint**: a portable fine-tuned training checkpoint supplied '
-            'with `--checkpoint`; no export is required. This uses dynamic '
-            '`run.py infer` separately for each image.\n'
-            '- **finetuned**: the exported Hindi inference model in '
-            '`output/hindi_rec_medium/inference/` by default (built by '
-            '`python run.py export`; set `PPOCRV6_INFER_DIR` for another experiment), run '
-            "through the pinned PaddleOCR checkout's predictor inside this "
-            'app. The Devanagari dictionary is embedded in `inference.yml`.\n'
-            '- **official**: the stock PP-OCRv6 medium pretrained model via '
-            '`python run.py infer --model official` (Chinese/English '
-            'dictionary; it cannot read Devanagari — expect empty or wrong '
-            'text).\n\n'
-            'Nothing is trained or modified here.'
+            'Upload a crop or full page. The official medium detector runs by '
+            'default with your custom recognizer. Select **Input is already '
+            'cropped** to bypass detection. There is no language selection.\n\n'
+            '- **finetuned**: exported Hindi inference bundle; supports full-page '
+            'detector+recognizer and direct cropped recognition.\n'
+            '- **checkpoint**: portable fine-tuned training checkpoint for direct '
+            'cropped inference without export.\n'
+            '- **official**: stock Chinese/English medium recognizer for cropped '
+            'comparison; it cannot read Devanagari.\n\n'
+            'Nothing is trained here.'
         )
         with gr.Row():
-            uploads = gr.File(label='Hindi crop images (multiple)',
+            uploads = gr.File(label='Hindi crop or page images (multiple)',
                               file_count='multiple', file_types=['image'])
             device = gr.Radio(choices=['gpu', 'cpu'], value='gpu', label='Device')
         model = gr.Radio(choices=model_choices, value=model_default,
@@ -263,14 +339,18 @@ def build_app():
                          info='checkpoint: portable fine-tuned weights without export. '
                               'finetuned: cached exported inference model. official: stock '
                               'pretrained checkpoint via run.py.')
+        cropped = crop_mode_for_model(model_default)
+        model.change(crop_mode_for_model, inputs=model, outputs=cropped)
         run_btn = gr.Button('Run inference', variant='primary')
-        results = gr.Dataframe(headers=['image', 'predicted text', 'confidence', 'status'],
-                               datatype=['str', 'str', 'str', 'str'],
+        results = gr.Dataframe(headers=['image', 'region', 'predicted text', 'confidence', 'status'],
+                               datatype=['str', 'str', 'str', 'str', 'str'],
                                label='Predictions', wrap=True)
+        page_images = gr.Gallery(label='Annotated pages')
+        page_json = gr.JSON(label='Full-page OCR results')
         log = gr.Textbox(label='console log', lines=14, max_lines=40,
                          autoscroll=True, interactive=False)
-        run_btn.click(infer_uploads, inputs=[uploads, model, device],
-                      outputs=[results, log], api_name='infer',
+        run_btn.click(infer_uploads, inputs=[uploads, model, device, cropped],
+                      outputs=[results, log, page_images, page_json], api_name='infer',
                       concurrency_limit=1)
     return demo
 
