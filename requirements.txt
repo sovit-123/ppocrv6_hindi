@@ -1,5 +1,5 @@
 huggingface-hub>=0.34,<2
 ijson>=3.3,<4
 Pillow==13.0.0
-PyYAML==6.0.3
+PyYAML==6.0.2
 tqdm>=4.70,<5
