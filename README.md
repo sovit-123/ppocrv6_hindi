@@ -75,7 +75,9 @@ training weights by default. Use `python run.py setup --model-size tiny` or
 Weights are named `weights/PP-OCRv6_<size>_rec_pretrained.pdparams`. It is safe
 to repeat setup: an existing checkout is validated and existing weights are
 reused. Preparation accepts any of these completed weight downloads, including
-when using `prepare.py --offline`.
+when using `prepare.py --offline`. Setup also downloads and extracts the official
+`PP-OCRv6_medium_det` inference bundle to `inference/PP-OCRv6_medium_det/` for
+full-page OCR. Rerun setup after upgrading to obtain that detector.
 
 The same `--model-size` value selects official weights during setup and the
 architecture during `configure`. Medium remains the default.
@@ -455,8 +457,81 @@ python gradio_app.py --inference-dir /path/to/inference
 
 `PPOCRV6_INFER_DIR=/path/to/inference` is also supported. The exported directory
 must be writable because upstream creates `ppocr_keys.txt` on first load.
-This project uses upstream crop inference; integrating custom weights into a
-full detector + recognizer pipeline is a later step.
+This project also supports full detector + recognizer inference through the
+high-level PaddleOCR API, described below.
+
+## 6. Detector-based and cropped inference
+
+The default high-level inference path uses the official `PP-OCRv6_medium_det`
+detector with a custom recognizer supplied by its **exported inference
+directory**. Use the same command for crops and full pages; there is no language
+dropdown or `lang` setting. Install the full-page runtime dependency
+(`paddlex[ocr-core]==3.7.2` is included in `requirements-training.txt`):
+
+```bash
+python -m pip install -r requirements-training.txt
+python run.py setup --model-size tiny
+```
+
+The setup command downloads both the selected recognition training checkpoint
+and the fixed medium detector. Run detector+recognizer inference:
+
+```bash
+python run.py infer \
+  --image /absolute/path/to/page.png \
+  --rec-model-dir output/hindi_rec_tiny/inference \
+  --output output/page_ocr \
+  --device gpu
+```
+
+The recognizer architecture name is read from `inference.yml`; tiny, small, and
+medium custom recognizers can all use the fixed medium detector. A raw training
+`.pdparams` is not accepted for this exported-model route—export it first with
+`run.py export`. `run.py page` remains available as an alias for the same
+detector-based behavior.
+
+If the input is already a crop and you want to bypass the detector, use
+`--cropped`:
+
+```bash
+python run.py infer \
+  --image /absolute/path/to/tight_crop.png \
+  --rec-model-dir output/hindi_rec_tiny/inference \
+  --cropped \
+  --device gpu
+```
+
+Cropped predictions are written to `predictions.txt` as
+`<image-path><TAB>text<TAB>confidence`. The existing dynamic
+`infer --checkpoint` route also remains direct cropped recognition and does not
+require the flag.
+
+Detector-based results are saved as annotated images and JSON under natural
+page-numbered directories:
+
+```text
+output/page_ocr/
+├── page_001/
+├── page_002/
+└── ...
+```
+
+The CLI prints recognized text and confidence per region. Document orientation,
+unwarping, and text-line orientation models are disabled.
+
+### Gradio
+
+Run the UI with an exported recognizer:
+
+```bash
+python gradio_app.py --inference-dir output/hindi_rec_tiny/inference
+```
+
+The official medium detector runs by default. Select **Input is already cropped
+(--cropped)** in the UI to bypass it. Full-page results include per-region rows,
+an annotated-page gallery, and structured JSON. The `checkpoint` and `official`
+routes remain crop-only; their cropped checkbox is selected and disabled
+automatically.
 
 ## Project files
 
@@ -464,7 +539,7 @@ full detector + recognizer pipeline is a later step.
 |---|---|
 | `prepare.py` | Multi-archive download/extraction, resumable manifests, streamed annotations, dictionary and split |
 | `check_data.py` | Archive, extraction, annotation, label, split, manifest, and provenance validation |
-| `run.py` | Pinned checkout and weight setup, checkpoint adaptation, config generation, upstream tool commands |
+| `run.py` | Pinned checkout/model setup, checkpoint adaptation, training/config commands, crop and full-page inference |
 | `requirements.txt` | Small data/preparation dependencies; Paddle installed separately |
 | `requirements-training.txt` | CPU smoke-tested top-level training dependency versions |
 | `vendor_config/` | Reference upstream YAML and its Apache license; actual config read from pinned checkout |
@@ -510,6 +585,22 @@ respective terms and credit the underlying source datasets for published work.
 This project's code is provided under Apache-2.0 (see LICENSE).
 
 ## Update log
+
+### 2026-11-25
+
+- Unified CLI and Gradio inference: the medium detector now runs by default for
+  `infer --rec-model-dir`, while `--cropped` explicitly bypasses detection.
+  `page` remains an alias. Gradio adds per-region results, annotated-page
+  gallery, and structured JSON; dynamic checkpoint and official routes remain
+  crop-only.
+
+### 2026-11-24
+
+- Added CLI-only full-page OCR with a fixed official `PP-OCRv6_medium_det`
+  detector and a custom exported recognizer selected by `--rec-model-dir`.
+  Setup downloads the detector bundle, and `run.py page` writes annotated images
+  and JSON per page. PaddleX OCR Core 3.7.2 is included in training requirements;
+  Gradio is unchanged.
 
 ### 2026-11-22
 
