@@ -21,8 +21,7 @@ MODEL_SIZES = ('tiny','small','medium')
 PRETRAINED_FILENAME = 'PP-OCRv6_medium_rec_pretrained.pdparams'
 INFERENCE = ROOT/'inference'
 DET_MODEL_NAME = 'PP-OCRv6_medium_det'
-DET_INFER_URL = ('https://paddle-model-ecology.bj.bcebos.com/paddlex/official_inference_model/'
-                 'paddle3.0.0/PP-OCRv6_medium_det_infer.tar')
+DET_MODEL_SIZES = ('tiny','small','medium')
 RESET_PREFIXES = ('head.ctc_head.fc.', 'head.ctc_head.fc2.',
                   'head.gtc_head.embedding.', 'head.gtc_head.tgt_word_prj.')
 
@@ -75,19 +74,28 @@ def inference_bundle_valid(path):
             and ((path/'inference.json').is_file() or (path/'inference.pdmodel').is_file()))
 
 
-def download_detector(inference=INFERENCE):
-    """Download and atomically extract the official medium detector bundle."""
-    final = inference/DET_MODEL_NAME
+def detector_model_name(det_size):
+    if det_size not in DET_MODEL_SIZES:
+        raise ValueError(f'Unknown detector size {det_size!r}; choose from {DET_MODEL_SIZES}.')
+    return f'PP-OCRv6_{det_size}_det'
+
+
+def download_detector(inference=INFERENCE, det_size='medium'):
+    """Download and atomically extract the selected official detector bundle."""
+    model_name = detector_model_name(det_size)
+    final = inference/model_name
     if inference_bundle_valid(final):
         return final
     inference.mkdir(parents=True,exist_ok=True)
-    archive = inference/f'{DET_MODEL_NAME}_infer.tar'
+    archive = inference/f'{model_name}_infer.tar'
     if not archive.exists():
         temp = archive.with_suffix('.part')
-        print('Downloading official medium detection model...',flush=True)
-        urllib.request.urlretrieve(DET_INFER_URL,temp)
+        print(f'Downloading official {det_size} detection model...',flush=True)
+        url = ('https://paddle-model-ecology.bj.bcebos.com/paddlex/official_inference_model/'
+               f'paddle3.0.0/{model_name}_infer.tar')
+        urllib.request.urlretrieve(url,temp)
         temp.replace(archive)
-    part = inference/f'{DET_MODEL_NAME}.part'
+    part = inference/f'{model_name}.part'
     if part.is_symlink():
         part.unlink()
     elif part.is_dir():
@@ -136,15 +144,15 @@ def require_setup(upstream=DEFAULT_UPSTREAM, weights=WEIGHTS, model_size=None):
                      'Run `python run.py setup --model-size {tiny,small,medium}` first.')
 
 
-def setup(upstream, weights=WEIGHTS, model_size='medium'):
+def setup(upstream, weights=WEIGHTS, model_size='medium', det_size='medium'):
     if not upstream.exists():
         shell(['git','clone','https://github.com/PaddlePaddle/PaddleOCR.git',upstream])
         shell(['git','checkout',PADDLE_REF], upstream)
     validate_upstream(upstream)
     original = download_weights(weights,model_size)
-    detector = download_detector()
+    detector = download_detector(det_size=det_size)
     print(f'Pinned upstream and official {model_size} weights ready: {original}')
-    print(f'Official medium detector ready: {detector}')
+    print(f'Official {det_size} detector ready: {detector}')
     print('Install the training dependencies as described in README.')
     return original
 
@@ -363,7 +371,7 @@ def input_files(image):
     raise ValueError(f'Input image/document/directory does not exist: {image}')
 
 
-def run_page(upstream, rec_model_dir, image, output, device):
+def run_page(upstream, rec_model_dir, image, output, device, det_size='medium'):
     """Run full-page OCR with the fixed medium detector and a custom recognizer."""
     total_start = time.perf_counter()
     inputs = input_files(image)
@@ -377,9 +385,9 @@ def run_page(upstream, rec_model_dir, image, output, device):
         raise RuntimeError('Full-page OCR requires paddlex[ocr-core]==3.7.2. '
                            'Install requirements-training.txt first.') from exc
     load_start = time.perf_counter()
-    detector_dir = download_detector()
+    detector_dir = download_detector(det_size=det_size)
     ocr = PaddleOCR(
-        text_detection_model_name=DET_MODEL_NAME,
+        text_detection_model_name=detector_model_name(det_size),
         text_detection_model_dir=str(detector_dir),
         text_recognition_model_name=rec_name,
         text_recognition_model_dir=str(rec_model_dir),
@@ -464,6 +472,8 @@ def main():
     p.add_argument('--upstream',type=Path,default=DEFAULT_UPSTREAM)
     p.add_argument('--model-size',choices=MODEL_SIZES,default='medium',
                    help='Model variant to download during setup or configure')
+    p.add_argument('--det-size',choices=DET_MODEL_SIZES,default='medium',
+                   help='Detector variant for setup and detector-based inference')
     p.add_argument('--data-dir',type=Path,default=ROOT/'data')
     p.add_argument('--prepared',type=Path,default=ROOT/'prepared')
     p.add_argument('--output',type=Path,
@@ -510,14 +520,18 @@ def main():
         p.error('--cropped is only valid with infer')
     if a.rec_model_dir and a.action not in ('infer','page'):
         p.error('--rec-model-dir is only valid with infer and page')
+    if a.det_size!='medium' and a.action not in ('setup','infer','page'):
+        p.error('--det-size is only valid with setup, infer, and page')
+    if a.cropped and a.det_size!='medium':
+        p.error('--det-size is not used with --cropped')
     if a.action=='setup':
-        setup(a.upstream,model_size=a.model_size); return
+        setup(a.upstream,model_size=a.model_size,det_size=a.det_size); return
     if a.action=='page':
         if not a.rec_model_dir:
             p.error('--rec-model-dir is required with page')
         if not a.image:
             p.error('--image is required with page')
-        run_page(a.upstream,a.rec_model_dir,a.image,a.output,a.device)
+        run_page(a.upstream,a.rec_model_dir,a.image,a.output,a.device,a.det_size)
         return
     if a.action=='infer' and a.rec_model_dir:
         if not a.image:
@@ -525,7 +539,7 @@ def main():
         if a.cropped:
             run_cropped(a.upstream,a.rec_model_dir,a.image,a.device)
         else:
-            run_page(a.upstream,a.rec_model_dir,a.image,a.output,a.device)
+            run_page(a.upstream,a.rec_model_dir,a.image,a.output,a.device,a.det_size)
         return
     config_path = a.output/'train_config.yml'
     if a.action=='configure':

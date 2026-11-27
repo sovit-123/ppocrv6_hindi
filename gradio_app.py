@@ -1,8 +1,9 @@
 """Gradio UI for testing PP-OCRv6 Hindi recognition checkpoints.
 
-Upload crops/full pages or provide an image directory. The official medium
-detector runs by default with the custom recognizer; the cropped checkbox
-bypasses it. Uploads and directory contents may be combined. Routes:
+Upload crops/full pages or provide an image directory. Choose the official
+tiny/small/medium detector (medium by default) with a custom recognizer; the
+cropped checkbox bypasses it and disables detector-size selection. Uploads and
+directory contents may be combined. Routes:
 
 - `finetuned` uses the exported inference bundle from --inference-dir and
   supports detector-based full-page OCR and direct cropped recognition. The
@@ -36,7 +37,7 @@ import cv2
 import gradio as gr
 from PIL import Image
 
-from run import DET_MODEL_NAME, benchmark_report, download_detector, input_files, recognizer_model_name
+from run import DET_MODEL_SIZES, benchmark_report, detector_model_name, download_detector, input_files, recognizer_model_name
 
 ROOT = Path(__file__).resolve().parent
 RUN_PY = ROOT / 'run.py'
@@ -152,26 +153,26 @@ def load_recognizer(device):
     return _RECOGNIZERS[device]
 
 
-def load_page_ocr(device):
-    """Load and cache the medium-detector plus custom-recognizer pipeline."""
+def load_page_ocr(device, det_size='medium'):
+    """Load and cache the selected detector plus custom-recognizer pipeline."""
     global _PAGE_OCR, _PAGE_KEY
     problem = exported_bundle_problem()
     if problem:
         raise gr.Error(problem)
     rec_dir = INFER_DIR.resolve()
-    key = (str(rec_dir), device)
+    key = (str(rec_dir), device, det_size)
     if _PAGE_OCR is None or _PAGE_KEY != key:
         if _PAGE_OCR is not None:
             _PAGE_OCR.close()
             _PAGE_OCR = None
             _PAGE_KEY = None
         rec_name = recognizer_model_name(rec_dir)
-        detector_dir = download_detector()
+        detector_dir = download_detector(det_size=det_size)
         if str(PADDLE_ROOT) not in sys.path:
             sys.path.insert(0, str(PADDLE_ROOT))
         from paddleocr import PaddleOCR
         _PAGE_OCR = PaddleOCR(
-            text_detection_model_name=DET_MODEL_NAME,
+            text_detection_model_name=detector_model_name(det_size),
             text_detection_model_dir=str(detector_dir),
             text_recognition_model_name=rec_name,
             text_recognition_model_dir=str(rec_dir),
@@ -184,7 +185,7 @@ def load_page_ocr(device):
     return _PAGE_OCR
 
 
-def infer_page(source, staged, device, annotate=False):
+def infer_page(source, staged, device, det_size='medium', annotate=False):
     """Run full-page OCR, optionally saving annotated images as well as JSON."""
     rows = []
     images = []
@@ -192,7 +193,7 @@ def infer_page(source, staged, device, annotate=False):
     inference_s = output_s = 0.0
     log = [f'+ [medium detector + custom recognizer] {staged.name} (device={device})']
     try:
-        ocr = load_page_ocr(device)
+        ocr = load_page_ocr(device,det_size)
         destination_root = ROOT / 'output' / 'gradio_ocr' / uuid.uuid4().hex
         inference_start = time.perf_counter()
         results = list(ocr.predict_iter(str(staged)))
@@ -273,7 +274,7 @@ def infer_checkpoint(source, staged, device):
     return infer_subprocess(source, command)
 
 
-def infer_uploads(files, model, device, cropped, directory, annotate=False):
+def infer_uploads(files, model, device, cropped, directory, annotate=False, det_size='medium'):
     """Process uploads and/or an image directory, with detection by default."""
     sources = [Path(f) for f in (files or [])]
     if directory and directory.strip():
@@ -300,7 +301,7 @@ def infer_uploads(files, model, device, cropped, directory, annotate=False):
         if cropped:
             load_recognizer(device)
         else:
-            load_page_ocr(device)
+            load_page_ocr(device,det_size)
     elif model == 'checkpoint':
         problem = checkpoint_bundle_problem()
         if problem:
@@ -319,7 +320,7 @@ def infer_uploads(files, model, device, cropped, directory, annotate=False):
                 log.append(f'# {source.name}: not a readable image ({exc})')
             else:
                 if model == 'finetuned' and not cropped:
-                    page_rows, lines, page_images, page_json, page_timing = infer_page(source, staged, device, annotate)
+                    page_rows, lines, page_images, page_json, page_timing = infer_page(source, staged, device, det_size, annotate)
                     rows.extend(page_rows)
                     images.extend(page_images)
                     page_data.extend(page_json)
@@ -344,6 +345,7 @@ def infer_uploads(files, model, device, cropped, directory, annotate=False):
             metrics = benchmark_report(pages,regions,model_load_s,inference_s,output_s,
                                        time.perf_counter()-total_start)
             metrics['mode'] = 'cropped' if cropped else 'detector'
+            metrics['det_size'] = det_size
             if model != 'finetuned':
                 metrics['timing_note'] = 'Dynamic subprocess model loading is included in inference_s.'
             yield rows, '\n'.join(log), images, page_data, metrics
@@ -353,6 +355,14 @@ def crop_mode_for_model(model):
     """Only exported fine-tuned models support detector-based full-page OCR."""
     return gr.Checkbox(value=model != 'finetuned', interactive=model == 'finetuned',
                        label='Input is already cropped (--cropped)')
+
+
+def detector_size_mode(model, cropped):
+    return gr.Dropdown(interactive=model == 'finetuned' and not cropped)
+
+
+def update_modes(model, cropped):
+    return crop_mode_for_model(model), detector_size_mode(model, cropped)
 
 
 def build_app():
@@ -387,9 +397,11 @@ def build_app():
         directory = gr.Textbox(label='Image directory (optional)',
                                placeholder='/absolute/path/to/images',
                                info='Optional directory of images/documents; may be combined with uploads.')
+        det_size = gr.Dropdown(choices=list(DET_MODEL_SIZES), value='medium', label='Detector size')
         cropped = crop_mode_for_model(model_default)
         annotate = gr.Checkbox(value=False, label='Generate annotated images')
-        model.change(crop_mode_for_model, inputs=model, outputs=cropped)
+        model.change(update_modes, inputs=[model, cropped], outputs=[cropped, det_size])
+        cropped.change(detector_size_mode, inputs=[model, cropped], outputs=det_size)
         run_btn = gr.Button('Run inference', variant='primary')
         results = gr.Dataframe(headers=['image', 'region', 'predicted text', 'confidence', 'status'],
                                datatype=['str', 'str', 'str', 'str', 'str'],
@@ -399,7 +411,7 @@ def build_app():
         benchmark = gr.JSON(label='Benchmark (pages/second)')
         log = gr.Textbox(label='console log', lines=14, max_lines=40,
                          autoscroll=True, interactive=False)
-        run_btn.click(infer_uploads, inputs=[uploads, model, device, cropped, directory, annotate],
+        run_btn.click(infer_uploads, inputs=[uploads, model, device, cropped, directory, annotate, det_size],
                       outputs=[results, log, page_images, page_json, benchmark], api_name='infer',
                       concurrency_limit=1)
     return demo

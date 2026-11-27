@@ -77,7 +77,9 @@ to repeat setup: an existing checkout is validated and existing weights are
 reused. Preparation accepts any of these completed weight downloads, including
 when using `prepare.py --offline`. Setup also downloads and extracts the official
 `PP-OCRv6_medium_det` inference bundle to `inference/PP-OCRv6_medium_det/` for
-full-page OCR. Rerun setup after upgrading to obtain that detector.
+full-page OCR. Rerun setup after upgrading to obtain that detector. Use
+`--det-size tiny`, `small`, or `medium` to download a different official
+variant; medium remains the default.
 
 The same `--model-size` value selects official weights during setup and the
 architecture during `configure`. Medium remains the default.
@@ -474,15 +476,21 @@ python run.py setup --model-size tiny
 ```
 
 The setup command downloads both the selected recognition training checkpoint
-and the fixed medium detector. Run detector+recognizer inference:
+and the selected official detector. Run detector+recognizer inference:
 
 ```bash
 python run.py infer \
   --image /absolute/path/to/page.png \
   --rec-model-dir output/hindi_rec_tiny/inference \
+  --det-size medium \
   --output output/page_ocr \
   --device gpu
 ```
+
+`--det-size` accepts `tiny`, `small`, or `medium` (default). Detector and
+recognizer sizes are independent, so a faster tiny detector can be paired with
+a larger recognizer. The option is rejected with `--cropped`, which bypasses
+detection.
 
 The recognizer architecture name is read from `inference.yml`; tiny, small, and
 medium custom recognizers can all use the fixed medium detector. A raw training
@@ -559,8 +567,10 @@ Run the UI with an exported recognizer:
 python gradio_app.py --inference-dir output/hindi_rec_tiny/inference
 ```
 
-The official medium detector runs by default. Select **Input is already cropped
-(--cropped)** in the UI to bypass it. Full-page results include per-region rows,
+The official medium detector runs by default; the **Detector size** dropdown
+also allows tiny or small and rebuilds the pipeline when changed. Select
+**Input is already cropped (--cropped)** in the UI to bypass it and disable
+detector-size selection. Full-page results include per-region rows,
 an annotated-page gallery, and structured JSON. The `checkpoint` and `official`
 routes remain crop-only; their cropped checkbox is selected and disabled
 automatically.
@@ -639,6 +649,10 @@ This project's code is provided under Apache-2.0 (see LICENSE).
   `benchmark.json`; Gradio shows a live benchmark panel. Annotated-image
   generation is optional and disabled by default so large directory runs avoid
   `save_to_img()` overhead unless explicitly requested; the table is unchanged.
+- Added independent `--det-size {tiny,small,medium}` selection for setup and
+  detector-based inference, plus a Gradio detector-size dropdown with
+  cache-safe model rebuilds. Medium remains the default; cropped inference
+  bypasses and rejects the option.
 
 ### 2026-11-25
 

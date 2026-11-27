@@ -18,7 +18,7 @@ from check_data import check_data
 from prepare import prepare, annotations, ctc_steps
 from run import (checkpoint_config_for, config_for, download_detector, download_weights, file_sha256,
                  require_setup, run_cropped, run_page, subset_for, ROOT, MODEL_SIZES, RESET_PREFIXES,
-                 DET_MODEL_NAME, pretrained_filename)
+                 DET_MODEL_NAME, DET_MODEL_SIZES, detector_model_name, pretrained_filename)
 
 class PipelineTest(unittest.TestCase):
     def test_single_shard_schema_filter_split_and_dedup(self):
@@ -206,7 +206,20 @@ class PipelineTest(unittest.TestCase):
             argv=['run.py','setup','--upstream',str(upstream),'--model-size','tiny']
             with mock.patch.object(sys,'argv',argv), mock.patch('run.setup') as setup:
                 run_module.main()
-                setup.assert_called_once_with(upstream.resolve(),model_size='tiny')
+                setup.assert_called_once_with(upstream.resolve(),model_size='tiny',det_size='medium')
+
+    def test_cli_detector_size_is_forwarded(self):
+        with tempfile.TemporaryDirectory() as t:
+            root=Path(t); upstream=root/'upstream'; rec=root/'rec'; image=root/'page.png'; image.write_bytes(b'image')
+            with mock.patch.object(sys,'argv',['run.py','setup','--upstream',str(upstream),'--det-size','tiny']), \
+                    mock.patch('run.setup') as setup:
+                run_module.main()
+                setup.assert_called_once_with(upstream.resolve(),model_size='medium',det_size='tiny')
+            with mock.patch.object(sys,'argv',['run.py','infer','--upstream',str(upstream),
+                                               '--rec-model-dir',str(rec),'--image',str(image),'--det-size','tiny']), \
+                    mock.patch('run.run_page') as page:
+                run_module.main()
+                self.assertEqual(page.call_args.args[-1],'tiny')
 
     def test_weight_download_is_cached_for_every_model_size(self):
         with tempfile.TemporaryDirectory() as t:
@@ -509,7 +522,7 @@ class PipelineTest(unittest.TestCase):
             class FakeOCR:
                 def predict_iter(self,_image): return iter([Result()])
             with mock.patch.object(app,'load_page_ocr',return_value=FakeOCR()):
-                rows,log,images,data,timing=app.infer_page(source,source,'cpu',True)
+                rows,log,images,data,timing=app.infer_page(source,source,'cpu',det_size='medium',annotate=True)
             self.assertEqual(rows[0][0],'page.png')
             self.assertEqual(rows[0][1],'page 1, region 1')
             self.assertEqual(rows[0][2],'हिन्दी')
@@ -593,7 +606,7 @@ class PipelineTest(unittest.TestCase):
             for name in ('b.jpg','a.png'): (images/name).write_bytes(b'image')
             (images/'notes.txt').write_text('ignored')
             calls=[]
-            def fake_page(source,_staged,_device,_annotate):
+            def fake_page(source,_staged,_device,_det_size,_annotate):
                 calls.append(source.name)
                 return ([[source.name,'page 1, region 1','हिन्दी','0.7500','ok']], ['log'], [],
                         [{'rec_texts':['हिन्दी']}], {'inference_s':0.1,'output_s':0.05})
@@ -607,5 +620,32 @@ class PipelineTest(unittest.TestCase):
             self.assertEqual(outputs[-1][0][1][0],'b.jpg')
             self.assertEqual(outputs[-1][4]['pages'],2)
             self.assertEqual(outputs[-1][4]['regions'],2)
+
+    def test_detector_size_selection_rebuilds_gradio_cache(self):
+        self.assertEqual(detector_model_name('tiny'),'PP-OCRv6_tiny_det')
+        self.assertEqual(detector_model_name('small'),'PP-OCRv6_small_det')
+        self.assertEqual(detector_model_name('medium'),'PP-OCRv6_medium_det')
+        with tempfile.TemporaryDirectory() as t, mock.patch.dict(sys.modules,{'gradio':mock.MagicMock(),'cv2':mock.MagicMock()}):
+            app=importlib.import_module('gradio_app')
+            root=Path(t); upstream=root/'upstream'; upstream.mkdir(); rec=root/'rec'; rec.mkdir()
+            app.PADDLE_ROOT=upstream; app.INFER_DIR=rec
+            class FakeOCR:
+                instances=[]
+                def __init__(self,**kwargs):
+                    self.kwargs=kwargs; self.closed=False; FakeOCR.instances.append(self)
+                def close(self): self.closed=True
+            with mock.patch.object(app,'exported_bundle_problem',return_value=None), \
+                    mock.patch.object(app,'recognizer_model_name',return_value='PP-OCRv6_tiny_rec'), \
+                    mock.patch.object(app,'download_detector',side_effect=lambda det_size: root/det_size), \
+                    mock.patch.dict(sys.modules,{'paddleocr':mock.MagicMock(PaddleOCR=FakeOCR)}):
+                app._PAGE_OCR=None; app._PAGE_KEY=None
+                first=app.load_page_ocr('cpu','tiny')
+                self.assertEqual(app._PAGE_KEY,(str(rec.resolve()),'cpu','tiny'))
+                second=app.load_page_ocr('cpu','small')
+                self.assertTrue(first.closed)
+                self.assertEqual(app._PAGE_KEY,(str(rec.resolve()),'cpu','small'))
+                self.assertEqual(FakeOCR.instances[0].kwargs['text_detection_model_name'],'PP-OCRv6_tiny_det')
+                self.assertEqual(FakeOCR.instances[1].kwargs['text_detection_model_name'],'PP-OCRv6_small_det')
+                app._PAGE_OCR=None; app._PAGE_KEY=None
 
 if __name__=='__main__': unittest.main()
