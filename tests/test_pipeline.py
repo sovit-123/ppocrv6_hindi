@@ -565,4 +565,23 @@ class PipelineTest(unittest.TestCase):
             self.assertIn('a.png',lines[0])
             self.assertIn('b.jpg',lines[1])
 
+    def test_gradio_accepts_image_directory(self):
+        with tempfile.TemporaryDirectory() as t, mock.patch.dict(sys.modules,{'gradio':mock.MagicMock(),'cv2':mock.MagicMock()}):
+            app=importlib.import_module('gradio_app')
+            root=Path(t); images=root/'images'; images.mkdir()
+            for name in ('b.jpg','a.png'): (images/name).write_bytes(b'image')
+            (images/'notes.txt').write_text('ignored')
+            calls=[]
+            def fake_page(source,_staged,_device):
+                calls.append(source.name)
+                return [[source.name,'page 1, region 1','हिन्दी','0.7500','ok']], ['log'], [], []
+            with mock.patch.object(app,'load_page_ocr',return_value=object()), \
+                    mock.patch.object(app,'stage_png',side_effect=lambda source,_work,_index: source), \
+                    mock.patch.object(app,'infer_page',side_effect=fake_page):
+                outputs=list(app.infer_uploads([],'finetuned','cpu',False,str(images)))
+            self.assertEqual(calls,['a.png','b.jpg'])
+            self.assertEqual(len(outputs[-1][0]),2)
+            self.assertEqual(outputs[-1][0][0][0],'a.png')
+            self.assertEqual(outputs[-1][0][1][0],'b.jpg')
+
 if __name__=='__main__': unittest.main()

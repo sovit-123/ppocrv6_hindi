@@ -1,7 +1,8 @@
 """Gradio UI for testing PP-OCRv6 Hindi recognition checkpoints.
 
-Upload crops or full pages. The official medium detector runs by default with
-the custom recognizer; the cropped checkbox bypasses it. Routes:
+Upload crops/full pages or provide an image directory. The official medium
+detector runs by default with the custom recognizer; the cropped checkbox
+bypasses it. Uploads and directory contents may be combined. Routes:
 
 - `finetuned` uses the exported inference bundle from --inference-dir and
   supports detector-based full-page OCR and direct cropped recognition. The
@@ -32,7 +33,7 @@ import cv2
 import gradio as gr
 from PIL import Image
 
-from run import DET_MODEL_NAME, download_detector, recognizer_model_name
+from run import DET_MODEL_NAME, download_detector, input_files, recognizer_model_name
 
 ROOT = Path(__file__).resolve().parent
 RUN_PY = ROOT / 'run.py'
@@ -260,11 +261,24 @@ def infer_checkpoint(source, staged, device):
     return infer_subprocess(source, command)
 
 
-def infer_uploads(files, model, device, cropped):
-    """Run detection by default, or direct recognition when input is cropped."""
+def infer_uploads(files, model, device, cropped, directory):
+    """Process uploads and/or an image directory, with detection by default."""
     sources = [Path(f) for f in (files or [])]
+    if directory and directory.strip():
+        try:
+            sources.extend(path for path, _ in input_files(Path(directory.strip()).expanduser()))
+        except ValueError as exc:
+            raise gr.Error(str(exc)) from exc
+    unique_sources = []
+    seen = set()
+    for source in sources:
+        resolved = source.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            unique_sources.append(resolved)
+    sources = unique_sources
     if not sources:
-        raise gr.Error('Upload at least one Hindi crop or page image first.')
+        raise gr.Error('Upload at least one Hindi crop/page image or provide an image directory.')
     model = model or ('checkpoint' if CHECKPOINT is not None else 'finetuned')
     device = device or 'gpu'
     cropped = bool(cropped) or model != 'finetuned'
@@ -339,6 +353,9 @@ def build_app():
                          info='checkpoint: portable fine-tuned weights without export. '
                               'finetuned: cached exported inference model. official: stock '
                               'pretrained checkpoint via run.py.')
+        directory = gr.Textbox(label='Image directory (optional)',
+                               placeholder='/absolute/path/to/images',
+                               info='Optional directory of images/documents; may be combined with uploads.')
         cropped = crop_mode_for_model(model_default)
         model.change(crop_mode_for_model, inputs=model, outputs=cropped)
         run_btn = gr.Button('Run inference', variant='primary')
@@ -349,7 +366,7 @@ def build_app():
         page_json = gr.JSON(label='Full-page OCR results')
         log = gr.Textbox(label='console log', lines=14, max_lines=40,
                          autoscroll=True, interactive=False)
-        run_btn.click(infer_uploads, inputs=[uploads, model, device, cropped],
+        run_btn.click(infer_uploads, inputs=[uploads, model, device, cropped, directory],
                       outputs=[results, log, page_images, page_json], api_name='infer',
                       concurrency_limit=1)
     return demo

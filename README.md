@@ -549,6 +549,11 @@ an annotated-page gallery, and structured JSON. The `checkpoint` and `official`
 routes remain crop-only; their cropped checkbox is selected and disabled
 automatically.
 
+The optional **Image directory** field accepts the same nonrecursive image and
+document extensions as the CLI. Directory files are processed in
+case-insensitive filename order and may be combined with uploaded files;
+resolved duplicate paths are processed only once.
+
 ## Project files
 
 | File | Purpose |
@@ -604,10 +609,11 @@ This project's code is provided under Apache-2.0 (see LICENSE).
 
 ### 2026-11-27
 
-- `run.py infer` and `run.py page` now accept an image/document directory for
-  detector-based and `--cropped` inference. Supported files are processed in
-  case-insensitive filename order with one model load, per-input output groups,
-  and a single combined `predictions.txt` for cropped runs.
+- `run.py infer`, `run.py page`, and Gradio now accept an image/document
+  directory for detector-based and `--cropped` inference. Supported files are
+  processed in case-insensitive filename order with one model load, per-input
+  output groups, and a single combined `predictions.txt` for cropped runs.
+  Gradio also allows directory inputs and uploads together with deduplication.
 
 ### 2026-11-25
 
