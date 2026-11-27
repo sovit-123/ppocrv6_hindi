@@ -322,11 +322,27 @@ def recognizer_model_name(rec_model_dir):
     return name
 
 
+INPUT_EXTENSIONS = {'.jpg','.jpeg','.png','.bmp','.gif','.webp','.tif','.tiff','.pdf'}
+
+
+def input_files(image):
+    """Return (path, output group) for one file or a directory of images/documents."""
+    image = image.resolve()
+    if image.is_file():
+        return [(image,'')]
+    if image.is_dir():
+        files = sorted((path for path in image.iterdir()
+                        if path.is_file() and path.suffix.lower() in INPUT_EXTENSIONS),
+                       key=lambda path: path.name.lower())
+        if not files:
+            raise ValueError(f'No supported images/documents found in {image}')
+        return [(path,f'{path.stem}{path.suffix.lower().replace(".","_")}') for path in files]
+    raise ValueError(f'Input image/document/directory does not exist: {image}')
+
+
 def run_page(upstream, rec_model_dir, image, output, device):
     """Run full-page OCR with the fixed medium detector and a custom recognizer."""
-    image = image.resolve()
-    if not image.is_file():
-        raise ValueError(f'Input image/document does not exist: {image}')
+    inputs = input_files(image)
     rec_model_dir = rec_model_dir.resolve()
     rec_name = recognizer_model_name(rec_model_dir)
     validate_upstream(upstream)
@@ -349,26 +365,28 @@ def run_page(upstream, rec_model_dir, image, output, device):
     )
     page_count = 0
     try:
-        for page_count, result in enumerate(ocr.predict_iter(str(image)),start=1):
-            destination = output/f'page_{page_count:03d}'
-            destination.mkdir(parents=True,exist_ok=True)
-            result.save_to_img(str(destination))
-            result.save_to_json(str(destination))
-            texts = list(result['rec_texts'])
-            scores = list(result['rec_scores'])
-            print(f'Page {page_count}: {len(texts)} text regions; saved to {destination}')
-            for text,score in zip(texts,scores):
-                print(f'  {text}\t{float(score):.4f}')
+        for input_path,group in inputs:
+            page_number = 0
+            for result in ocr.predict_iter(str(input_path)):
+                page_number += 1
+                page_count += 1
+                destination = output/group/f'page_{page_number:03d}' if group else output/f'page_{page_number:03d}'
+                destination.mkdir(parents=True,exist_ok=True)
+                result.save_to_img(str(destination))
+                result.save_to_json(str(destination))
+                texts = list(result['rec_texts'])
+                scores = list(result['rec_scores'])
+                print(f'Page {page_count}: {len(texts)} text regions; saved to {destination}')
+                for text,score in zip(texts,scores):
+                    print(f'  {text}\t{float(score):.4f}')
     finally:
         ocr.close()
     print(f'Processed {page_count} page(s) from {image}')
 
 
 def run_cropped(upstream, rec_model_dir, image, device):
-    """Recognize one already-cropped image without running the detector."""
-    image = image.resolve()
-    if not image.is_file():
-        raise ValueError(f'Input crop does not exist: {image}')
+    """Recognize one crop or a directory of crops without running the detector."""
+    inputs = input_files(image)
     rec_model_dir = rec_model_dir.resolve()
     rec_name = recognizer_model_name(rec_model_dir)
     validate_upstream(upstream)
@@ -380,13 +398,14 @@ def run_cropped(upstream, rec_model_dir, image, device):
                            'Install requirements-training.txt first.') from exc
     recognizer = TextRecognition(model_name=rec_name,model_dir=str(rec_model_dir),device=device)
     try:
-        results = recognizer.predict(str(image))
         with (ROOT/'predictions.txt').open('w',encoding='utf-8') as output:
-            for result in results:
-                text = result['rec_text']
-                score = float(result['rec_score'])
-                output.write(f'{image}\t{text}\t{score}\n')
-                print(f'{image}\t{text}\t{score:.4f}')
+            for input_path,_ in inputs:
+                results = recognizer.predict(str(input_path))
+                for result in results:
+                    text = result['rec_text']
+                    score = float(result['rec_score'])
+                    output.write(f'{input_path}\t{text}\t{score}\n')
+                    print(f'{input_path}\t{text}\t{score:.4f}')
     finally:
         recognizer.close()
 

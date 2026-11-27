@@ -514,4 +514,55 @@ class PipelineTest(unittest.TestCase):
             self.assertEqual(data[0]['rec_texts'],['हिन्दी'])
             self.assertTrue(Path(images[0]).is_file())
 
+    def test_page_accepts_directory_of_images(self):
+        with tempfile.TemporaryDirectory() as t:
+            root=Path(t); upstream=root/'upstream'; upstream.mkdir(); rec=root/'rec'; rec.mkdir()
+            (rec/'inference.yml').write_text('Global:\n  model_name: PP-OCRv6_tiny_rec\n')
+            (rec/'inference.json').write_text('{}'); (rec/'inference.pdiparams').write_bytes(b'model')
+            images=root/'images'; images.mkdir()
+            for name in ('b.jpg','a.png'): (images/name).write_bytes(b'image')
+            (images/'notes.txt').write_text('ignored')
+            class Result:
+                def __getitem__(self,key): return {'rec_texts':['हिन्दी'],'rec_scores':[0.75]}[key]
+                def save_to_img(self,path): (Path(path)/'annotated.png').write_bytes(b'image')
+                def save_to_json(self,path): (Path(path)/'result.json').write_text('{}')
+            class FakeOCR:
+                calls=[]
+                def __init__(self,**kwargs): pass
+                def predict_iter(self,image):
+                    FakeOCR.calls.append(Path(image).name)
+                    return iter([Result()])
+                def close(self): pass
+            with mock.patch.dict(sys.modules,{'paddleocr':mock.MagicMock(PaddleOCR=FakeOCR)}), \
+                    mock.patch('run.validate_upstream'), mock.patch('run.download_detector',return_value=root/'detector'):
+                run_page(upstream,rec,images,root/'output','cpu')
+            self.assertEqual(FakeOCR.calls,['a.png','b.jpg'])
+            self.assertTrue((root/'output/a_png/page_001/annotated.png').is_file())
+            self.assertTrue((root/'output/b_jpg/page_001/result.json').is_file())
+
+    def test_cropped_accepts_directory_of_images(self):
+        with tempfile.TemporaryDirectory() as t:
+            root=Path(t); upstream=root/'upstream'; upstream.mkdir(); rec=root/'rec'; rec.mkdir()
+            (rec/'inference.yml').write_text('Global:\n  model_name: PP-OCRv6_tiny_rec\n')
+            (rec/'inference.json').write_text('{}'); (rec/'inference.pdiparams').write_bytes(b'model')
+            images=root/'images'; images.mkdir()
+            for name in ('b.jpg','a.png'): (images/name).write_bytes(b'image')
+            class FakeRecognition:
+                calls=[]
+                closed=False
+                def __init__(self,**kwargs): pass
+                def predict(self,image):
+                    FakeRecognition.calls.append(image)
+                    return [{'rec_text':'हिन्दी','rec_score':0.8}]
+                def close(self): FakeRecognition.closed=True
+            with mock.patch.dict(sys.modules,{'paddleocr':mock.MagicMock(TextRecognition=FakeRecognition)}), \
+                    mock.patch('run.validate_upstream'), mock.patch('run.ROOT',root):
+                run_cropped(upstream,rec,images,'cpu')
+            self.assertEqual(len(FakeRecognition.calls),2)
+            self.assertTrue(FakeRecognition.closed)
+            lines=(root/'predictions.txt').read_text().splitlines()
+            self.assertEqual(len(lines),2)
+            self.assertIn('a.png',lines[0])
+            self.assertIn('b.jpg',lines[1])
+
 if __name__=='__main__': unittest.main()

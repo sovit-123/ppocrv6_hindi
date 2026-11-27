@@ -490,6 +490,22 @@ medium custom recognizers can all use the fixed medium detector. A raw training
 `run.py export`. `run.py page` remains available as an alias for the same
 detector-based behavior.
 
+`--image` also accepts a directory. Immediate (nonrecursive) files ending in
+`.jpg`, `.jpeg`, `.png`, `.bmp`, `.gif`, `.webp`, `.tif`, `.tiff`, or `.pdf`
+are processed in case-insensitive filename order, reusing one loaded pipeline:
+
+```bash
+python run.py infer \
+  --image /absolute/path/to/image_directory \
+  --rec-model-dir output/hindi_rec_tiny/inference \
+  --output output/page_ocr \
+  --device gpu
+```
+
+Directory results are separated by input filename and extension, for example
+`output/page_ocr/example_png/page_001/`. The same directory behavior works with
+`--cropped`, writing every prediction to `predictions.txt` in one run.
+
 If the input is already a crop and you want to bypass the detector, use
 `--cropped`:
 
@@ -585,6 +601,13 @@ respective terms and credit the underlying source datasets for published work.
 This project's code is provided under Apache-2.0 (see LICENSE).
 
 ## Update log
+
+### 2026-11-27
+
+- `run.py infer` and `run.py page` now accept an image/document directory for
+  detector-based and `--cropped` inference. Supported files are processed in
+  case-insensitive filename order with one model load, per-input output groups,
+  and a single combined `predictions.txt` for cropped runs.
 
 ### 2026-11-25
 
