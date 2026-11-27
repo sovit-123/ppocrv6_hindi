@@ -461,6 +461,9 @@ class PipelineTest(unittest.TestCase):
             for page in (1,2):
                 self.assertTrue((output/f'page_{page:03d}/annotated.png').is_file())
                 self.assertTrue((output/f'page_{page:03d}/result.json').is_file())
+            benchmark=json.loads((output/'benchmark.json').read_text())
+            self.assertEqual(benchmark['pages'],2)
+            self.assertEqual(benchmark['regions'],2)
 
     def test_infer_cli_cropped_flag_selects_direct_route(self):
         with tempfile.TemporaryDirectory() as t:
@@ -506,13 +509,31 @@ class PipelineTest(unittest.TestCase):
             class FakeOCR:
                 def predict_iter(self,_image): return iter([Result()])
             with mock.patch.object(app,'load_page_ocr',return_value=FakeOCR()):
-                rows,log,images,data=app.infer_page(source,source,'cpu')
+                rows,log,images,data,timing=app.infer_page(source,source,'cpu',True)
             self.assertEqual(rows[0][0],'page.png')
             self.assertEqual(rows[0][1],'page 1, region 1')
             self.assertEqual(rows[0][2],'हिन्दी')
             self.assertEqual(rows[0][4],'ok')
             self.assertEqual(data[0]['rec_texts'],['हिन्दी'])
             self.assertTrue(Path(images[0]).is_file())
+            self.assertIn('inference_s',timing)
+            self.assertIn('output_s',timing)
+
+    def test_gradio_annotations_disabled_by_default(self):
+        with tempfile.TemporaryDirectory() as t, mock.patch.dict(sys.modules,{'gradio':mock.MagicMock(),'cv2':mock.MagicMock()}):
+            app=importlib.import_module('gradio_app')
+            root=Path(t); app.ROOT=root; source=root/'page.png'; source.write_bytes(b'image')
+            class Result:
+                def __init__(self): self.json={'rec_texts':['हिन्दी'],'rec_scores':[0.75]}
+                def __getitem__(self,key): return self.json[key]
+                def save_to_img(self,path): raise AssertionError('save_to_img should be disabled by default')
+                def save_to_json(self,path): (Path(path)/'result.json').write_text('{}')
+            class FakeOCR:
+                def predict_iter(self,_image): return iter([Result()])
+            with mock.patch.object(app,'load_page_ocr',return_value=FakeOCR()):
+                _rows,_log,images,_data,_timing=app.infer_page(source,source,'cpu')
+            self.assertEqual(images,[])
+            self.assertEqual(len(list((root/'output/gradio_ocr').rglob('result.json'))),1)
 
     def test_page_accepts_directory_of_images(self):
         with tempfile.TemporaryDirectory() as t:
@@ -572,16 +593,19 @@ class PipelineTest(unittest.TestCase):
             for name in ('b.jpg','a.png'): (images/name).write_bytes(b'image')
             (images/'notes.txt').write_text('ignored')
             calls=[]
-            def fake_page(source,_staged,_device):
+            def fake_page(source,_staged,_device,_annotate):
                 calls.append(source.name)
-                return [[source.name,'page 1, region 1','हिन्दी','0.7500','ok']], ['log'], [], []
+                return ([[source.name,'page 1, region 1','हिन्दी','0.7500','ok']], ['log'], [],
+                        [{'rec_texts':['हिन्दी']}], {'inference_s':0.1,'output_s':0.05})
             with mock.patch.object(app,'load_page_ocr',return_value=object()), \
                     mock.patch.object(app,'stage_png',side_effect=lambda source,_work,_index: source), \
                     mock.patch.object(app,'infer_page',side_effect=fake_page):
-                outputs=list(app.infer_uploads([],'finetuned','cpu',False,str(images)))
+                outputs=list(app.infer_uploads([],'finetuned','cpu',False,str(images),False))
             self.assertEqual(calls,['a.png','b.jpg'])
             self.assertEqual(len(outputs[-1][0]),2)
             self.assertEqual(outputs[-1][0][0][0],'a.png')
             self.assertEqual(outputs[-1][0][1][0],'b.jpg')
+            self.assertEqual(outputs[-1][4]['pages'],2)
+            self.assertEqual(outputs[-1][4]['regions'],2)
 
 if __name__=='__main__': unittest.main()

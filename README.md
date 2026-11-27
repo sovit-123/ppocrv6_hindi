@@ -535,6 +535,22 @@ output/page_ocr/
 The CLI prints recognized text and confidence per region. Document orientation,
 unwarping, and text-line orientation models are disabled.
 
+### Pages/second benchmark
+
+Each high-level CLI inference run writes `benchmark.json` in its output
+directory (the project root for cropped runs) and prints a summary containing:
+
+- `pages` and `regions`
+- `model_load_s`, `inference_s`, `output_s`, and `total_s`
+- `pages_per_second_inference`
+- `pages_per_second_total`
+- `regions_per_second_inference`
+
+Detector-based pages are OCR result objects; cropped pages are input images.
+The inference timer covers full consumption of `predict_iter()`, while artifact
+writing is timed separately. Model loading is included in total time but not in
+inference-only throughput.
+
 ### Gradio
 
 Run the UI with an exported recognizer:
@@ -552,7 +568,11 @@ automatically.
 The optional **Image directory** field accepts the same nonrecursive image and
 document extensions as the CLI. Directory files are processed in
 case-insensitive filename order and may be combined with uploaded files;
-resolved duplicate paths are processed only once.
+resolved duplicate paths are processed only once. The **Benchmark
+(pages/second)** panel reports the same per-run timing stages and throughput.
+**Generate annotated images** is unchecked by default: annotated-image creation
+and the gallery are skipped unless explicitly enabled, while JSON output and
+the prediction table remain unchanged.
 
 ## Project files
 
@@ -614,6 +634,11 @@ This project's code is provided under Apache-2.0 (see LICENSE).
   processed in case-insensitive filename order with one model load, per-input
   output groups, and a single combined `predictions.txt` for cropped runs.
   Gradio also allows directory inputs and uploads together with deduplication.
+- CLI and Gradio inference now report model-load, inference, output, and total
+  times plus inference-only and end-to-end pages/second. CLI runs write
+  `benchmark.json`; Gradio shows a live benchmark panel. Annotated-image
+  generation is optional and disabled by default so large directory runs avoid
+  `save_to_img()` overhead unless explicitly requested; the table is unchanged.
 
 ### 2026-11-25
 

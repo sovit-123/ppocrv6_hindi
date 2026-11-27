@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import time
 import urllib.request
 import yaml
 
@@ -322,6 +323,28 @@ def recognizer_model_name(rec_model_dir):
     return name
 
 
+def benchmark_report(pages, regions, model_load_s, inference_s, output_s, total_s):
+    """Build a per-run pages/second report with separate timing stages."""
+    return {'pages':pages,'regions':regions,'model_load_s':model_load_s,
+            'inference_s':inference_s,'output_s':output_s,'total_s':total_s,
+            'pages_per_second_inference':pages/inference_s if inference_s > 0 else None,
+            'pages_per_second_total':pages/total_s if total_s > 0 else None,
+            'regions_per_second_inference':regions/inference_s if inference_s > 0 else None}
+
+
+def write_benchmark(output, metrics):
+    output.mkdir(parents=True,exist_ok=True)
+    (output/'benchmark.json').write_text(json.dumps(metrics,indent=2),encoding='utf-8')
+    print('Benchmark:')
+    print(f"  Pages: {metrics['pages']}; regions: {metrics['regions']}")
+    print(f"  Model load: {metrics['model_load_s']:.3f}s; inference: {metrics['inference_s']:.3f}s; "
+          f"output: {metrics['output_s']:.3f}s; total: {metrics['total_s']:.3f}s")
+    if metrics['pages_per_second_inference'] is not None:
+        print(f"  Pages/s (inference): {metrics['pages_per_second_inference']:.3f}")
+    if metrics['pages_per_second_total'] is not None:
+        print(f"  Pages/s (end-to-end): {metrics['pages_per_second_total']:.3f}")
+
+
 INPUT_EXTENSIONS = {'.jpg','.jpeg','.png','.bmp','.gif','.webp','.tif','.tiff','.pdf'}
 
 
@@ -342,6 +365,7 @@ def input_files(image):
 
 def run_page(upstream, rec_model_dir, image, output, device):
     """Run full-page OCR with the fixed medium detector and a custom recognizer."""
+    total_start = time.perf_counter()
     inputs = input_files(image)
     rec_model_dir = rec_model_dir.resolve()
     rec_name = recognizer_model_name(rec_model_dir)
@@ -352,6 +376,7 @@ def run_page(upstream, rec_model_dir, image, output, device):
     except ImportError as exc:
         raise RuntimeError('Full-page OCR requires paddlex[ocr-core]==3.7.2. '
                            'Install requirements-training.txt first.') from exc
+    load_start = time.perf_counter()
     detector_dir = download_detector()
     ocr = PaddleOCR(
         text_detection_model_name=DET_MODEL_NAME,
@@ -363,29 +388,40 @@ def run_page(upstream, rec_model_dir, image, output, device):
         use_textline_orientation=False,
         device=device,
     )
-    page_count = 0
+    model_load_s = time.perf_counter() - load_start
+    page_count = regions = 0
+    inference_s = output_s = 0.0
     try:
         for input_path,group in inputs:
+            inference_start = time.perf_counter()
+            results = list(ocr.predict_iter(str(input_path)))
+            inference_s += time.perf_counter() - inference_start
             page_number = 0
-            for result in ocr.predict_iter(str(input_path)):
+            for result in results:
                 page_number += 1
                 page_count += 1
                 destination = output/group/f'page_{page_number:03d}' if group else output/f'page_{page_number:03d}'
+                output_start = time.perf_counter()
                 destination.mkdir(parents=True,exist_ok=True)
                 result.save_to_img(str(destination))
                 result.save_to_json(str(destination))
+                output_s += time.perf_counter() - output_start
                 texts = list(result['rec_texts'])
                 scores = list(result['rec_scores'])
+                regions += len(texts)
                 print(f'Page {page_count}: {len(texts)} text regions; saved to {destination}')
                 for text,score in zip(texts,scores):
                     print(f'  {text}\t{float(score):.4f}')
     finally:
         ocr.close()
+    total_s = time.perf_counter() - total_start
     print(f'Processed {page_count} page(s) from {image}')
+    write_benchmark(output,benchmark_report(page_count,regions,model_load_s,inference_s,output_s,total_s))
 
 
 def run_cropped(upstream, rec_model_dir, image, device):
     """Recognize one crop or a directory of crops without running the detector."""
+    total_start = time.perf_counter()
     inputs = input_files(image)
     rec_model_dir = rec_model_dir.resolve()
     rec_name = recognizer_model_name(rec_model_dir)
@@ -396,18 +432,30 @@ def run_cropped(upstream, rec_model_dir, image, device):
     except ImportError as exc:
         raise RuntimeError('Full-page OCR requires paddlex[ocr-core]==3.7.2. '
                            'Install requirements-training.txt first.') from exc
+    load_start = time.perf_counter()
     recognizer = TextRecognition(model_name=rec_name,model_dir=str(rec_model_dir),device=device)
+    model_load_s = time.perf_counter() - load_start
+    page_count = regions = 0
+    inference_s = output_s = 0.0
     try:
         with (ROOT/'predictions.txt').open('w',encoding='utf-8') as output:
             for input_path,_ in inputs:
+                inference_start = time.perf_counter()
                 results = recognizer.predict(str(input_path))
+                inference_s += time.perf_counter() - inference_start
+                page_count += 1
+                regions += len(results)
+                output_start = time.perf_counter()
                 for result in results:
                     text = result['rec_text']
                     score = float(result['rec_score'])
                     output.write(f'{input_path}\t{text}\t{score}\n')
                     print(f'{input_path}\t{text}\t{score:.4f}')
+                output_s += time.perf_counter() - output_start
     finally:
         recognizer.close()
+    total_s = time.perf_counter() - total_start
+    write_benchmark(ROOT,benchmark_report(page_count,regions,model_load_s,inference_s,output_s,total_s))
 
 
 def main():

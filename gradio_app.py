@@ -13,7 +13,9 @@ bypasses it. Uploads and directory contents may be combined. Routes:
   comparison and is also crop-only.
 
 Dynamic crop routes rewrite `predictions.txt`. Detector-based results include
-per-region rows, annotated images, and structured JSON. Nothing is trained.
+per-region rows, annotated images, and structured JSON. Annotated-image
+creation is optional and disabled by default. Every run also reports
+model-load, inference, output, and total time plus pages/second. Nothing is trained.
 
 Run with the same Python environment used for run.py, plus gradio
 (`python -m pip install gradio`; opencv-python is in requirements-training.txt).
@@ -25,6 +27,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import traceback
 import uuid
 from pathlib import Path
@@ -33,7 +36,7 @@ import cv2
 import gradio as gr
 from PIL import Image
 
-from run import DET_MODEL_NAME, download_detector, input_files, recognizer_model_name
+from run import DET_MODEL_NAME, benchmark_report, download_detector, input_files, recognizer_model_name
 
 ROOT = Path(__file__).resolve().parent
 RUN_PY = ROOT / 'run.py'
@@ -181,33 +184,42 @@ def load_page_ocr(device):
     return _PAGE_OCR
 
 
-def infer_page(source, staged, device):
-    """Run full-page detection and recognition, returning regions and artifacts."""
+def infer_page(source, staged, device, annotate=False):
+    """Run full-page OCR, optionally saving annotated images as well as JSON."""
     rows = []
     images = []
     page_data = []
+    inference_s = output_s = 0.0
     log = [f'+ [medium detector + custom recognizer] {staged.name} (device={device})']
     try:
         ocr = load_page_ocr(device)
         destination_root = ROOT / 'output' / 'gradio_ocr' / uuid.uuid4().hex
-        for page_number, result in enumerate(ocr.predict_iter(str(staged)), start=1):
+        inference_start = time.perf_counter()
+        results = list(ocr.predict_iter(str(staged)))
+        inference_s += time.perf_counter() - inference_start
+        for page_number, result in enumerate(results, start=1):
             destination = destination_root / f'page_{page_number:03d}'
+            output_start = time.perf_counter()
             destination.mkdir(parents=True, exist_ok=True)
-            result.save_to_img(str(destination))
+            if annotate:
+                result.save_to_img(str(destination))
             result.save_to_json(str(destination))
+            output_s += time.perf_counter() - output_start
             texts = list(result['rec_texts'])
             scores = list(result['rec_scores'])
             for region_number, (text, score) in enumerate(zip(texts, scores), start=1):
                 rows.append([source.name, f'page {page_number}, region {region_number}',
                              text, f'{float(score):.4f}', 'ok'])
-            images.extend(str(path) for path in sorted(destination.rglob('*.png')))
-            images.extend(str(path) for path in sorted(destination.rglob('*.jpg')))
+            if annotate:
+                images.extend(str(path) for path in sorted(destination.rglob('*.png')))
+                images.extend(str(path) for path in sorted(destination.rglob('*.jpg')))
             page_data.append(result.json)
             log.append(f'Page {page_number}: {len(texts)} regions; saved to {destination}')
     except Exception as exc:
         log.append(traceback.format_exc())
         rows.append([source.name, '', '', '', f'predictor error: {exc}'])
-    return rows, log, images, page_data
+    timing = {'inference_s': inference_s, 'output_s': output_s}
+    return rows, log, images, page_data, timing
 
 
 def infer_finetuned(source, staged, device):
@@ -261,7 +273,7 @@ def infer_checkpoint(source, staged, device):
     return infer_subprocess(source, command)
 
 
-def infer_uploads(files, model, device, cropped, directory):
+def infer_uploads(files, model, device, cropped, directory, annotate=False):
     """Process uploads and/or an image directory, with detection by default."""
     sources = [Path(f) for f in (files or [])]
     if directory and directory.strip():
@@ -279,9 +291,11 @@ def infer_uploads(files, model, device, cropped, directory):
     sources = unique_sources
     if not sources:
         raise gr.Error('Upload at least one Hindi crop/page image or provide an image directory.')
+    total_start = time.perf_counter()
     model = model or ('checkpoint' if CHECKPOINT is not None else 'finetuned')
     device = device or 'gpu'
     cropped = bool(cropped) or model != 'finetuned'
+    load_start = time.perf_counter()
     if model == 'finetuned':
         if cropped:
             load_recognizer(device)
@@ -291,6 +305,9 @@ def infer_uploads(files, model, device, cropped, directory):
         problem = checkpoint_bundle_problem()
         if problem:
             raise gr.Error(problem)
+    model_load_s = time.perf_counter() - load_start if model == 'finetuned' else 0.0
+    pages = regions = 0
+    inference_s = output_s = 0.0
     rows, log, images, page_data = [], [], [], []
     with tempfile.TemporaryDirectory(prefix='ppocrv6_gradio_') as tmp:
         work = Path(tmp)
@@ -302,20 +319,34 @@ def infer_uploads(files, model, device, cropped, directory):
                 log.append(f'# {source.name}: not a readable image ({exc})')
             else:
                 if model == 'finetuned' and not cropped:
-                    page_rows, lines, page_images, page_json = infer_page(source, staged, device)
+                    page_rows, lines, page_images, page_json, page_timing = infer_page(source, staged, device, annotate)
                     rows.extend(page_rows)
                     images.extend(page_images)
                     page_data.extend(page_json)
+                    pages += len(page_json)
+                    regions += sum(row[4] == 'ok' for row in page_rows)
+                    inference_s += page_timing['inference_s']
+                    output_s += page_timing['output_s']
                 else:
+                    inference_start = time.perf_counter()
                     if model == 'finetuned':
                         row, lines = infer_finetuned(source, staged, device)
                     elif model == 'checkpoint':
                         row, lines = infer_checkpoint(source, staged, device)
                     else:
                         row, lines = infer_official(source, staged, device)
+                    inference_s += time.perf_counter() - inference_start
                     rows.append(row)
+                    if row[4] == 'ok':
+                        pages += 1
+                        regions += 1
                 log.extend(lines)
-            yield rows, '\n'.join(log), images, page_data
+            metrics = benchmark_report(pages,regions,model_load_s,inference_s,output_s,
+                                       time.perf_counter()-total_start)
+            metrics['mode'] = 'cropped' if cropped else 'detector'
+            if model != 'finetuned':
+                metrics['timing_note'] = 'Dynamic subprocess model loading is included in inference_s.'
+            yield rows, '\n'.join(log), images, page_data, metrics
 
 
 def crop_mode_for_model(model):
@@ -357,6 +388,7 @@ def build_app():
                                placeholder='/absolute/path/to/images',
                                info='Optional directory of images/documents; may be combined with uploads.')
         cropped = crop_mode_for_model(model_default)
+        annotate = gr.Checkbox(value=False, label='Generate annotated images')
         model.change(crop_mode_for_model, inputs=model, outputs=cropped)
         run_btn = gr.Button('Run inference', variant='primary')
         results = gr.Dataframe(headers=['image', 'region', 'predicted text', 'confidence', 'status'],
@@ -364,10 +396,11 @@ def build_app():
                                label='Predictions', wrap=True)
         page_images = gr.Gallery(label='Annotated pages')
         page_json = gr.JSON(label='Full-page OCR results')
+        benchmark = gr.JSON(label='Benchmark (pages/second)')
         log = gr.Textbox(label='console log', lines=14, max_lines=40,
                          autoscroll=True, interactive=False)
-        run_btn.click(infer_uploads, inputs=[uploads, model, device, cropped, directory],
-                      outputs=[results, log, page_images, page_json], api_name='infer',
+        run_btn.click(infer_uploads, inputs=[uploads, model, device, cropped, directory, annotate],
+                      outputs=[results, log, page_images, page_json, benchmark], api_name='infer',
                       concurrency_limit=1)
     return demo
 
