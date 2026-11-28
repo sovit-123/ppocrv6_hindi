@@ -77,7 +77,9 @@ to repeat setup: an existing checkout is validated and existing weights are
 reused. Preparation accepts any of these completed weight downloads, including
 when using `prepare.py --offline`. Setup also downloads and extracts the official
 `PP-OCRv6_medium_det` inference bundle to `inference/PP-OCRv6_medium_det/` for
-full-page OCR. Rerun setup after upgrading to obtain that detector.
+full-page OCR. Rerun setup after upgrading to obtain that detector. Use
+`--det-size tiny`, `small`, or `medium` to download a different official
+variant; medium remains the default.
 
 The same `--model-size` value selects official weights during setup and the
 architecture during `configure`. Medium remains the default.
@@ -474,21 +476,43 @@ python run.py setup --model-size tiny
 ```
 
 The setup command downloads both the selected recognition training checkpoint
-and the fixed medium detector. Run detector+recognizer inference:
+and the selected official detector. Run detector+recognizer inference:
 
 ```bash
 python run.py infer \
   --image /absolute/path/to/page.png \
   --rec-model-dir output/hindi_rec_tiny/inference \
+  --det-size medium \
   --output output/page_ocr \
   --device gpu
 ```
+
+`--det-size` accepts `tiny`, `small`, or `medium` (default). Detector and
+recognizer sizes are independent, so a faster tiny detector can be paired with
+a larger recognizer. The option is rejected with `--cropped`, which bypasses
+detection.
 
 The recognizer architecture name is read from `inference.yml`; tiny, small, and
 medium custom recognizers can all use the fixed medium detector. A raw training
 `.pdparams` is not accepted for this exported-model route—export it first with
 `run.py export`. `run.py page` remains available as an alias for the same
 detector-based behavior.
+
+`--image` also accepts a directory. Immediate (nonrecursive) files ending in
+`.jpg`, `.jpeg`, `.png`, `.bmp`, `.gif`, `.webp`, `.tif`, `.tiff`, or `.pdf`
+are processed in case-insensitive filename order, reusing one loaded pipeline:
+
+```bash
+python run.py infer \
+  --image /absolute/path/to/image_directory \
+  --rec-model-dir output/hindi_rec_tiny/inference \
+  --output output/page_ocr \
+  --device gpu
+```
+
+Directory results are separated by input filename and extension, for example
+`output/page_ocr/example_png/page_001/`. The same directory behavior works with
+`--cropped`, writing every prediction to `predictions.txt` in one run.
 
 If the input is already a crop and you want to bypass the detector, use
 `--cropped`:
@@ -519,6 +543,22 @@ output/page_ocr/
 The CLI prints recognized text and confidence per region. Document orientation,
 unwarping, and text-line orientation models are disabled.
 
+### Pages/second benchmark
+
+Each high-level CLI inference run writes `benchmark.json` in its output
+directory (the project root for cropped runs) and prints a summary containing:
+
+- `pages` and `regions`
+- `model_load_s`, `inference_s`, `output_s`, and `total_s`
+- `pages_per_second_inference`
+- `pages_per_second_total`
+- `regions_per_second_inference`
+
+Detector-based pages are OCR result objects; cropped pages are input images.
+The inference timer covers full consumption of `predict_iter()`, while artifact
+writing is timed separately. Model loading is included in total time but not in
+inference-only throughput.
+
 ### Gradio
 
 Run the UI with an exported recognizer:
@@ -527,11 +567,22 @@ Run the UI with an exported recognizer:
 python gradio_app.py --inference-dir output/hindi_rec_tiny/inference
 ```
 
-The official medium detector runs by default. Select **Input is already cropped
-(--cropped)** in the UI to bypass it. Full-page results include per-region rows,
+The official medium detector runs by default; the **Detector size** dropdown
+also allows tiny or small and rebuilds the pipeline when changed. Select
+**Input is already cropped (--cropped)** in the UI to bypass it and disable
+detector-size selection. Full-page results include per-region rows,
 an annotated-page gallery, and structured JSON. The `checkpoint` and `official`
 routes remain crop-only; their cropped checkbox is selected and disabled
 automatically.
+
+The optional **Image directory** field accepts the same nonrecursive image and
+document extensions as the CLI. Directory files are processed in
+case-insensitive filename order and may be combined with uploaded files;
+resolved duplicate paths are processed only once. The **Benchmark
+(pages/second)** panel reports the same per-run timing stages and throughput.
+**Generate annotated images** is unchecked by default: annotated-image creation
+and the gallery are skipped unless explicitly enabled, while JSON output and
+the prediction table remain unchanged.
 
 ## Project files
 
@@ -585,6 +636,23 @@ respective terms and credit the underlying source datasets for published work.
 This project's code is provided under Apache-2.0 (see LICENSE).
 
 ## Update log
+
+### 2026-11-27
+
+- `run.py infer`, `run.py page`, and Gradio now accept an image/document
+  directory for detector-based and `--cropped` inference. Supported files are
+  processed in case-insensitive filename order with one model load, per-input
+  output groups, and a single combined `predictions.txt` for cropped runs.
+  Gradio also allows directory inputs and uploads together with deduplication.
+- CLI and Gradio inference now report model-load, inference, output, and total
+  times plus inference-only and end-to-end pages/second. CLI runs write
+  `benchmark.json`; Gradio shows a live benchmark panel. Annotated-image
+  generation is optional and disabled by default so large directory runs avoid
+  `save_to_img()` overhead unless explicitly requested; the table is unchanged.
+- Added independent `--det-size {tiny,small,medium}` selection for setup and
+  detector-based inference, plus a Gradio detector-size dropdown with
+  cache-safe model rebuilds. Medium remains the default; cropped inference
+  bypasses and rejects the option.
 
 ### 2026-11-25
 

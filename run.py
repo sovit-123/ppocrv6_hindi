@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import time
 import urllib.request
 import yaml
 
@@ -20,8 +21,7 @@ MODEL_SIZES = ('tiny','small','medium')
 PRETRAINED_FILENAME = 'PP-OCRv6_medium_rec_pretrained.pdparams'
 INFERENCE = ROOT/'inference'
 DET_MODEL_NAME = 'PP-OCRv6_medium_det'
-DET_INFER_URL = ('https://paddle-model-ecology.bj.bcebos.com/paddlex/official_inference_model/'
-                 'paddle3.0.0/PP-OCRv6_medium_det_infer.tar')
+DET_MODEL_SIZES = ('tiny','small','medium')
 RESET_PREFIXES = ('head.ctc_head.fc.', 'head.ctc_head.fc2.',
                   'head.gtc_head.embedding.', 'head.gtc_head.tgt_word_prj.')
 
@@ -74,19 +74,28 @@ def inference_bundle_valid(path):
             and ((path/'inference.json').is_file() or (path/'inference.pdmodel').is_file()))
 
 
-def download_detector(inference=INFERENCE):
-    """Download and atomically extract the official medium detector bundle."""
-    final = inference/DET_MODEL_NAME
+def detector_model_name(det_size):
+    if det_size not in DET_MODEL_SIZES:
+        raise ValueError(f'Unknown detector size {det_size!r}; choose from {DET_MODEL_SIZES}.')
+    return f'PP-OCRv6_{det_size}_det'
+
+
+def download_detector(inference=INFERENCE, det_size='medium'):
+    """Download and atomically extract the selected official detector bundle."""
+    model_name = detector_model_name(det_size)
+    final = inference/model_name
     if inference_bundle_valid(final):
         return final
     inference.mkdir(parents=True,exist_ok=True)
-    archive = inference/f'{DET_MODEL_NAME}_infer.tar'
+    archive = inference/f'{model_name}_infer.tar'
     if not archive.exists():
         temp = archive.with_suffix('.part')
-        print('Downloading official medium detection model...',flush=True)
-        urllib.request.urlretrieve(DET_INFER_URL,temp)
+        print(f'Downloading official {det_size} detection model...',flush=True)
+        url = ('https://paddle-model-ecology.bj.bcebos.com/paddlex/official_inference_model/'
+               f'paddle3.0.0/{model_name}_infer.tar')
+        urllib.request.urlretrieve(url,temp)
         temp.replace(archive)
-    part = inference/f'{DET_MODEL_NAME}.part'
+    part = inference/f'{model_name}.part'
     if part.is_symlink():
         part.unlink()
     elif part.is_dir():
@@ -135,15 +144,15 @@ def require_setup(upstream=DEFAULT_UPSTREAM, weights=WEIGHTS, model_size=None):
                      'Run `python run.py setup --model-size {tiny,small,medium}` first.')
 
 
-def setup(upstream, weights=WEIGHTS, model_size='medium'):
+def setup(upstream, weights=WEIGHTS, model_size='medium', det_size='medium'):
     if not upstream.exists():
         shell(['git','clone','https://github.com/PaddlePaddle/PaddleOCR.git',upstream])
         shell(['git','checkout',PADDLE_REF], upstream)
     validate_upstream(upstream)
     original = download_weights(weights,model_size)
-    detector = download_detector()
+    detector = download_detector(det_size=det_size)
     print(f'Pinned upstream and official {model_size} weights ready: {original}')
-    print(f'Official medium detector ready: {detector}')
+    print(f'Official {det_size} detector ready: {detector}')
     print('Install the training dependencies as described in README.')
     return original
 
@@ -322,11 +331,50 @@ def recognizer_model_name(rec_model_dir):
     return name
 
 
-def run_page(upstream, rec_model_dir, image, output, device):
-    """Run full-page OCR with the fixed medium detector and a custom recognizer."""
+def benchmark_report(pages, regions, model_load_s, inference_s, output_s, total_s):
+    """Build a per-run pages/second report with separate timing stages."""
+    return {'pages':pages,'regions':regions,'model_load_s':model_load_s,
+            'inference_s':inference_s,'output_s':output_s,'total_s':total_s,
+            'pages_per_second_inference':pages/inference_s if inference_s > 0 else None,
+            'pages_per_second_total':pages/total_s if total_s > 0 else None,
+            'regions_per_second_inference':regions/inference_s if inference_s > 0 else None}
+
+
+def write_benchmark(output, metrics):
+    output.mkdir(parents=True,exist_ok=True)
+    (output/'benchmark.json').write_text(json.dumps(metrics,indent=2),encoding='utf-8')
+    print('Benchmark:')
+    print(f"  Pages: {metrics['pages']}; regions: {metrics['regions']}")
+    print(f"  Model load: {metrics['model_load_s']:.3f}s; inference: {metrics['inference_s']:.3f}s; "
+          f"output: {metrics['output_s']:.3f}s; total: {metrics['total_s']:.3f}s")
+    if metrics['pages_per_second_inference'] is not None:
+        print(f"  Pages/s (inference): {metrics['pages_per_second_inference']:.3f}")
+    if metrics['pages_per_second_total'] is not None:
+        print(f"  Pages/s (end-to-end): {metrics['pages_per_second_total']:.3f}")
+
+
+INPUT_EXTENSIONS = {'.jpg','.jpeg','.png','.bmp','.gif','.webp','.tif','.tiff','.pdf'}
+
+
+def input_files(image):
+    """Return (path, output group) for one file or a directory of images/documents."""
     image = image.resolve()
-    if not image.is_file():
-        raise ValueError(f'Input image/document does not exist: {image}')
+    if image.is_file():
+        return [(image,'')]
+    if image.is_dir():
+        files = sorted((path for path in image.iterdir()
+                        if path.is_file() and path.suffix.lower() in INPUT_EXTENSIONS),
+                       key=lambda path: path.name.lower())
+        if not files:
+            raise ValueError(f'No supported images/documents found in {image}')
+        return [(path,f'{path.stem}{path.suffix.lower().replace(".","_")}') for path in files]
+    raise ValueError(f'Input image/document/directory does not exist: {image}')
+
+
+def run_page(upstream, rec_model_dir, image, output, device, det_size='medium'):
+    """Run full-page OCR with the fixed medium detector and a custom recognizer."""
+    total_start = time.perf_counter()
+    inputs = input_files(image)
     rec_model_dir = rec_model_dir.resolve()
     rec_name = recognizer_model_name(rec_model_dir)
     validate_upstream(upstream)
@@ -336,9 +384,10 @@ def run_page(upstream, rec_model_dir, image, output, device):
     except ImportError as exc:
         raise RuntimeError('Full-page OCR requires paddlex[ocr-core]==3.7.2. '
                            'Install requirements-training.txt first.') from exc
-    detector_dir = download_detector()
+    load_start = time.perf_counter()
+    detector_dir = download_detector(det_size=det_size)
     ocr = PaddleOCR(
-        text_detection_model_name=DET_MODEL_NAME,
+        text_detection_model_name=detector_model_name(det_size),
         text_detection_model_dir=str(detector_dir),
         text_recognition_model_name=rec_name,
         text_recognition_model_dir=str(rec_model_dir),
@@ -347,28 +396,41 @@ def run_page(upstream, rec_model_dir, image, output, device):
         use_textline_orientation=False,
         device=device,
     )
-    page_count = 0
+    model_load_s = time.perf_counter() - load_start
+    page_count = regions = 0
+    inference_s = output_s = 0.0
     try:
-        for page_count, result in enumerate(ocr.predict_iter(str(image)),start=1):
-            destination = output/f'page_{page_count:03d}'
-            destination.mkdir(parents=True,exist_ok=True)
-            result.save_to_img(str(destination))
-            result.save_to_json(str(destination))
-            texts = list(result['rec_texts'])
-            scores = list(result['rec_scores'])
-            print(f'Page {page_count}: {len(texts)} text regions; saved to {destination}')
-            for text,score in zip(texts,scores):
-                print(f'  {text}\t{float(score):.4f}')
+        for input_path,group in inputs:
+            inference_start = time.perf_counter()
+            results = list(ocr.predict_iter(str(input_path)))
+            inference_s += time.perf_counter() - inference_start
+            page_number = 0
+            for result in results:
+                page_number += 1
+                page_count += 1
+                destination = output/group/f'page_{page_number:03d}' if group else output/f'page_{page_number:03d}'
+                output_start = time.perf_counter()
+                destination.mkdir(parents=True,exist_ok=True)
+                result.save_to_img(str(destination))
+                result.save_to_json(str(destination))
+                output_s += time.perf_counter() - output_start
+                texts = list(result['rec_texts'])
+                scores = list(result['rec_scores'])
+                regions += len(texts)
+                print(f'Page {page_count}: {len(texts)} text regions; saved to {destination}')
+                for text,score in zip(texts,scores):
+                    print(f'  {text}\t{float(score):.4f}')
     finally:
         ocr.close()
+    total_s = time.perf_counter() - total_start
     print(f'Processed {page_count} page(s) from {image}')
+    write_benchmark(output,benchmark_report(page_count,regions,model_load_s,inference_s,output_s,total_s))
 
 
 def run_cropped(upstream, rec_model_dir, image, device):
-    """Recognize one already-cropped image without running the detector."""
-    image = image.resolve()
-    if not image.is_file():
-        raise ValueError(f'Input crop does not exist: {image}')
+    """Recognize one crop or a directory of crops without running the detector."""
+    total_start = time.perf_counter()
+    inputs = input_files(image)
     rec_model_dir = rec_model_dir.resolve()
     rec_name = recognizer_model_name(rec_model_dir)
     validate_upstream(upstream)
@@ -378,17 +440,30 @@ def run_cropped(upstream, rec_model_dir, image, device):
     except ImportError as exc:
         raise RuntimeError('Full-page OCR requires paddlex[ocr-core]==3.7.2. '
                            'Install requirements-training.txt first.') from exc
+    load_start = time.perf_counter()
     recognizer = TextRecognition(model_name=rec_name,model_dir=str(rec_model_dir),device=device)
+    model_load_s = time.perf_counter() - load_start
+    page_count = regions = 0
+    inference_s = output_s = 0.0
     try:
-        results = recognizer.predict(str(image))
         with (ROOT/'predictions.txt').open('w',encoding='utf-8') as output:
-            for result in results:
-                text = result['rec_text']
-                score = float(result['rec_score'])
-                output.write(f'{image}\t{text}\t{score}\n')
-                print(f'{image}\t{text}\t{score:.4f}')
+            for input_path,_ in inputs:
+                inference_start = time.perf_counter()
+                results = recognizer.predict(str(input_path))
+                inference_s += time.perf_counter() - inference_start
+                page_count += 1
+                regions += len(results)
+                output_start = time.perf_counter()
+                for result in results:
+                    text = result['rec_text']
+                    score = float(result['rec_score'])
+                    output.write(f'{input_path}\t{text}\t{score}\n')
+                    print(f'{input_path}\t{text}\t{score:.4f}')
+                output_s += time.perf_counter() - output_start
     finally:
         recognizer.close()
+    total_s = time.perf_counter() - total_start
+    write_benchmark(ROOT,benchmark_report(page_count,regions,model_load_s,inference_s,output_s,total_s))
 
 
 def main():
@@ -397,6 +472,8 @@ def main():
     p.add_argument('--upstream',type=Path,default=DEFAULT_UPSTREAM)
     p.add_argument('--model-size',choices=MODEL_SIZES,default='medium',
                    help='Model variant to download during setup or configure')
+    p.add_argument('--det-size',choices=DET_MODEL_SIZES,default='medium',
+                   help='Detector variant for setup and detector-based inference')
     p.add_argument('--data-dir',type=Path,default=ROOT/'data')
     p.add_argument('--prepared',type=Path,default=ROOT/'prepared')
     p.add_argument('--output',type=Path,
@@ -443,14 +520,18 @@ def main():
         p.error('--cropped is only valid with infer')
     if a.rec_model_dir and a.action not in ('infer','page'):
         p.error('--rec-model-dir is only valid with infer and page')
+    if a.det_size!='medium' and a.action not in ('setup','infer','page'):
+        p.error('--det-size is only valid with setup, infer, and page')
+    if a.cropped and a.det_size!='medium':
+        p.error('--det-size is not used with --cropped')
     if a.action=='setup':
-        setup(a.upstream,model_size=a.model_size); return
+        setup(a.upstream,model_size=a.model_size,det_size=a.det_size); return
     if a.action=='page':
         if not a.rec_model_dir:
             p.error('--rec-model-dir is required with page')
         if not a.image:
             p.error('--image is required with page')
-        run_page(a.upstream,a.rec_model_dir,a.image,a.output,a.device)
+        run_page(a.upstream,a.rec_model_dir,a.image,a.output,a.device,a.det_size)
         return
     if a.action=='infer' and a.rec_model_dir:
         if not a.image:
@@ -458,7 +539,7 @@ def main():
         if a.cropped:
             run_cropped(a.upstream,a.rec_model_dir,a.image,a.device)
         else:
-            run_page(a.upstream,a.rec_model_dir,a.image,a.output,a.device)
+            run_page(a.upstream,a.rec_model_dir,a.image,a.output,a.device,a.det_size)
         return
     config_path = a.output/'train_config.yml'
     if a.action=='configure':
